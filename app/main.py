@@ -15,10 +15,29 @@ def sh(cmd: str, cwd=None):
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 def signed_download(bucket: str, path: str, dest: str):
+    if not SUPABASE_URL or not SUPABASE_URL.startswith("https://"):
+        raise RuntimeError(f"SUPABASE_URL is missing or invalid: {SUPABASE_URL!r}")
+
+    # Ask Supabase for a signed URL (v2 SDK returns dict)
     res = supabase.storage.from_(bucket).create_signed_url(path, 3600)
-    if "signedURL" not in res:
-        raise RuntimeError("Could not create signed URL")
-    url = SUPABASE_URL + res["signedURL"]
+
+    # Handle both possible keys
+    signed = res.get("signedURL") or res.get("signed_url")
+    if not signed:
+        raise RuntimeError(f"create_signed_url returned no URL for {bucket}:{path} → {res}")
+
+    # If the SDK returned a full URL, use it as-is; otherwise prefix with project URL
+    if signed.startswith("http://") or signed.startswith("https://"):
+        url = signed
+    else:
+        # signed typically begins with "/storage/v1/object/sign/..."
+        url = SUPABASE_URL.rstrip("/") + signed
+
+    # Optional: quick sanity guard
+    if not url.startswith("https://"):
+        raise RuntimeError(f"Bad signed URL: {url}")
+
+    # Download
     with urllib.request.urlopen(url) as r, open(dest, "wb") as f:
         f.write(r.read())
 
