@@ -67,6 +67,18 @@ def find_layers(base_dir: str) -> Optional[str]:
             best_dir, best_count = root, count
     return best_dir if best_count > 0 else None
 
+# ---------- PrusaSlicer runner helpers (Flatpak in headless container) ----------
+PRUSA_FLATPAK_APP = "com.prusa3d.PrusaSlicer"
+# Use a safe, reusable launcher that:
+#  - starts a DBus session (dbus-run-session)
+#  - runs a virtual X display (xvfb-run) so GTK/OpenGL init succeeds even with --no-gui
+#  - grants Flatpak full access to the container filesystem (so /profiles, /tmp, job workdir are visible)
+PRUSA_LAUNCH_PREFIX = (
+    'xvfb-run -a -s "-screen 0 1024x768x24" '
+    'dbus-run-session -- '
+    f'flatpak run --branch=stable --filesystem=host {PRUSA_FLATPAK_APP}'
+)
+
 # ---------- Health/Readiness ----------
 @app.get("/healthz")
 def healthz():
@@ -127,8 +139,8 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             signed_download(bucket, path, input_model)
 
             # 2) Profiles
-            printer_id   = job["printer_id"]
-            print_profile= job["print_profile"]
+            printer_id     = job["printer_id"]
+            print_profile  = job["print_profile"]
             printer_json   = f"/profiles/printers/{printer_id}.json"
             prusa_ini      = f"/profiles/resin_presets/{'0.05mm_standard.ini' if print_profile == '0.05mm_standard' else print_profile + '.ini'}"
             uvtools_params = f"/profiles/uvtools_params/{printer_id}_std_resin.json"
@@ -142,27 +154,21 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             out_dir = os.path.join(wd, "out")
             os.makedirs(out_dir, exist_ok=True)
 
-            # 3) Slice with PrusaSlicer (Flatpak + Xvfb + DBus). Try explicit SLA output dir, then fallback.
+            # 3) Slice with PrusaSlicer (Flatpak + Xvfb + DBus), with full FS access
             slices_target = os.path.join(out_dir, "slices")
             os.makedirs(slices_target, exist_ok=True)
 
+            # Build base CLI (headless export)
+            base_args = (
+                f' --no-gui --export-sla --export-3mf --load "{prusa_ini}" '
+                f'--output "{out_dir}"'
+            )
+
             cmd1_options = [
-                # Preferred: explicit SLA output directory (supported on many builds)
-                (
-                    'dbus-run-session -- '
-                    'xvfb-run -a -s "-screen 0 1024x768x24" '
-                    'flatpak run --command=PrusaSlicer com.prusa3d.PrusaSlicer '
-                    f'--no-gui --export-sla --export-3mf --load "{prusa_ini}" '
-                    f'--output "{out_dir}" --sla-output "{slices_target}" "{input_model}"'
-                ),
-                # Fallback: let PrusaSlicer decide, we’ll auto-discover slice folder
-                (
-                    'dbus-run-session -- '
-                    'xvfb-run -a -s "-screen 0 1024x768x24" '
-                    'flatpak run --command=PrusaSlicer com.prusa3d.PrusaSlicer '
-                    f'--no-gui --export-sla --export-3mf --load "{prusa_ini}" '
-                    f'--output "{out_dir}" "{input_model}"'
-                ),
+                # Preferred: explicit SLA output directory
+                f'{PRUSA_LAUNCH_PREFIX} {base_args} --sla-output "{slices_target}" "{input_model}"',
+                # Fallback: let PrusaSlicer decide; we'll discover the slices folder
+                f'{PRUSA_LAUNCH_PREFIX} {base_args} "{input_model}"',
             ]
 
             rc1, log1 = -1, ""
