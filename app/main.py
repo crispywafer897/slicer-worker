@@ -67,60 +67,33 @@ def find_layers(base_dir: str) -> Optional[str]:
             best_dir, best_count = root, count
     return best_dir if best_count > 0 else None
 
-# ---------- PrusaSlicer runner helpers (Flatpak in headless container) ----------
+# ---------- PrusaSlicer runner (Flatpak in headless container, no D-Bus) ----------
 PRUSA_FLATPAK_APP = "com.prusa3d.PrusaSlicer"
 
 def run_prusaslicer_headless(args: list[str]) -> tuple[int, str]:
     """
-    Start a private D-Bus session + Xvfb, run PrusaSlicer Flatpak with full FS access,
-    then tear everything down. Returns (rc, combined_output).
-    This avoids the 'Could not connect: No such file or directory' error in containers.
+    Run PrusaSlicer Flatpak headlessly *without* a session D-Bus:
+      - disable session bus:    flatpak run --no-session-bus
+      - disable a11y bus:       NO_AT_BRIDGE=1
+      - headless X:             xvfb-run
+      - sandbox perms:          --filesystem=host --socket=x11
+    Returns (rc, combined_output).
     """
-    # Ensure an XDG runtime dir; D-Bus often expects it
     env = os.environ.copy()
-    xdg_runtime = env.get("XDG_RUNTIME_DIR", "/tmp/xdg-runtime")
-    os.makedirs(xdg_runtime, exist_ok=True)
-    try:
-        os.chmod(xdg_runtime, 0o700)
-    except Exception:
-        pass
-    env["XDG_RUNTIME_DIR"] = xdg_runtime
+    env["NO_AT_BRIDGE"] = "1"  # prevent GTK from touching the accessibility bus
 
-    # Start a dedicated session bus
-    # We capture both the bus address and PID so we can clean up.
-    dbus_cmd = ["dbus-daemon", "--session", "--print-address=1", "--print-pid=1", "--fork"]
-    try:
-        # Run dbus-daemon and capture stdout (two lines: address, pid)
-        out = subprocess.check_output(dbus_cmd, env=env, text=True)
-    except Exception as e:
-        return 1, f"Failed to start dbus-daemon: {e}\n(Check that the 'dbus' package is installed.)"
-
-    lines = [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
-    if len(lines) < 2:
-        return 1, f"dbus-daemon did not print address and pid; got: {out!r}"
-    dbus_addr, dbus_pid = lines[0], lines[1]
-    env["DBUS_SESSION_BUS_ADDRESS"] = dbus_addr
-
-    # Compose PrusaSlicer command
-    # - xvfb-run provides a virtual X for GTK/OpenGL init (even with --no-gui)
-    # - --filesystem=host lets Flatpak see /profiles, /tmp, and our working dir
     base = [
         "xvfb-run", "-a", "-s", "-screen 0 1024x768x24",
-        "flatpak", "run", "--branch=stable", "--filesystem=host", PRUSA_FLATPAK_APP
+        "flatpak", "run",
+        "--branch=stable",
+        "--no-session-bus",      # <-- avoid needing DBus session entirely
+        "--filesystem=host",     # see /profiles, /tmp, and job workdir
+        "--socket=x11",          # allow Xvfb X11
+        PRUSA_FLATPAK_APP
     ]
-    # Join into a single shell-safe command for logging and our sh() helper
+
     cmd = " ".join(shlex.quote(x) for x in base + args)
-
-    try:
-        rc, log = sh(cmd, env=env)
-    finally:
-        # Tear down the session bus we started
-        try:
-            subprocess.run(["kill", "-9", dbus_pid], check=False)
-        except Exception:
-            pass
-
-    return rc, log
+    return sh(cmd, env=env)
 
 # ---------- Health/Readiness ----------
 @app.get("/healthz")
@@ -197,21 +170,18 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             out_dir = os.path.join(wd, "out")
             os.makedirs(out_dir, exist_ok=True)
 
-            # 3) Slice with PrusaSlicer (Flatpak + Xvfb + private D-Bus session), with full FS access
+            # 3) Slice with PrusaSlicer (Flatpak headless, without D-Bus)
             slices_target = os.path.join(out_dir, "slices")
             os.makedirs(slices_target, exist_ok=True)
 
-            # Build base Prusa CLI (headless export)
             base_args = [
                 "--no-gui", "--export-sla", "--export-3mf",
                 "--load", prusa_ini,
                 "--output", out_dir,
             ]
-
-            # We try explicit SLA dir first, then fallback
             cmd_variants = [
-                base_args + ["--sla-output", slices_target, input_model],
-                base_args + [input_model],
+                base_args + ["--sla-output", slices_target, input_model],  # prefer explicit SLA dir
+                base_args + [input_model],                                  # fallback
             ]
 
             rc1, log1 = -1, ""
