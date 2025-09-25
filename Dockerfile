@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y \
 RUN flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo \
  && flatpak install -y flathub com.prusa3d.PrusaSlicer
 
-# UVtools CLI (v5.2.0)
+# UVtools CLI (pin v5.2.0; bump as needed)
 RUN wget -O /tmp/uvtools.zip \
       https://github.com/sn4k3/UVtools/releases/download/v5.2.0/UVtools_linux-x64_v5.2.0.zip \
  && unzip /tmp/uvtools.zip -d /opt/uvtools \
@@ -27,9 +27,11 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY profiles /profiles
 
-# (Optional) prime Flatpak metadata (non-fatal)
+# (Optional) prime Flatpak metadata (non-fatal; helps cold starts a bit)
 RUN flatpak info com.prusa3d.PrusaSlicer || true
 
-# Serve the FastAPI app
+# Cloud Run port
 ENV PORT=8080
-CMD ["python3","-m","uvicorn","app.main:app","--host","0.0.0.0","--port","8080"]
+
+# Start API
+CMD exec python3 -m uvicorn app.main:app --host 0.0.0.0 --port ${PORT}
