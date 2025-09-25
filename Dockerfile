@@ -1,17 +1,19 @@
 FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+# Prevent GTK from touching the accessibility (AT-SPI) D-Bus (pairs with --no-session-bus)
+ENV NO_AT_BRIDGE=1
 
-# Base deps (+ xvfb for headless, GTK/OpenGL libs), Flatpak, D-Bus
+# Base deps (+ xvfb for headless, GTK/OpenGL libs), Flatpak, D-Bus, and xauth for xvfb-run
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget curl unzip ca-certificates \
     python3 python3-pip git \
-    xvfb libgtk-3-0 libgl1 libglu1-mesa libxrender1 \
+    xvfb xauth \
+    libgtk-3-0 libgl1 libglu1-mesa libxrender1 \
     flatpak dbus dbus-x11 \
   && rm -rf /var/lib/apt/lists/*
 
 # Add Flathub (SYSTEM scope) and install PrusaSlicer (SYSTEM scope)
-# Key changes: add --system to both commands
 RUN flatpak --system remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo \
   && flatpak --system install -y flathub com.prusa3d.PrusaSlicer
 
@@ -33,12 +35,6 @@ COPY profiles /profiles
 
 # Cloud Run port
 ENV PORT=8080
-
-# IMPORTANT: At runtime, always wrap flatpak run with dbus-run-session (and xvfb-run if headless GUI is needed)
-# Example health check / smoke test you can borrow for debugging:
-#   dbus-run-session -- flatpak run --branch=stable com.prusa3d.PrusaSlicer --version
-# Headless GUI example:
-#   xvfb-run -a dbus-run-session -- flatpak run com.prusa3d.PrusaSlicer --help
 
 # Start API
 CMD ["python3", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
