@@ -1,0 +1,8 @@
+{
+  "id": "elegoo_mars3",
+  "vendor": "Elegoo",
+  "format": "ctb_v3",
+  "screen_px": [4098, 2560],
+  "pixel_um": 35,
+  "volume_mm": [143, 89, 175]
+}
