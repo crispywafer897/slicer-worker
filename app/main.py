@@ -1,4 +1,4 @@
-import os, subprocess, shutil, json, tempfile, zipfile, urllib.request, glob
+import os, subprocess, shutil, json, tempfile, zipfile, urllib.request, glob, shlex
 from typing import Dict, Any, Optional
 
 from fastapi import FastAPI, Header
@@ -19,9 +19,9 @@ def _supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # ---------- Utilities ----------
-def sh(cmd: str, cwd: Optional[str] = None):
+def sh(cmd: str, cwd: Optional[str] = None, env: Optional[dict] = None):
     """Run a shell command and capture output."""
-    p = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True)
+    p = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, env=env)
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 def update_job(job_id: str, **fields):
@@ -69,15 +69,58 @@ def find_layers(base_dir: str) -> Optional[str]:
 
 # ---------- PrusaSlicer runner helpers (Flatpak in headless container) ----------
 PRUSA_FLATPAK_APP = "com.prusa3d.PrusaSlicer"
-# Use a safe, reusable launcher that:
-#  - starts a DBus session (dbus-run-session)
-#  - runs a virtual X display (xvfb-run) so GTK/OpenGL init succeeds even with --no-gui
-#  - grants Flatpak full access to the container filesystem (so /profiles, /tmp, job workdir are visible)
-PRUSA_LAUNCH_PREFIX = (
-    'xvfb-run -a -s "-screen 0 1024x768x24" '
-    'dbus-run-session -- '
-    f'flatpak run --branch=stable --filesystem=host {PRUSA_FLATPAK_APP}'
-)
+
+def run_prusaslicer_headless(args: list[str]) -> tuple[int, str]:
+    """
+    Start a private D-Bus session + Xvfb, run PrusaSlicer Flatpak with full FS access,
+    then tear everything down. Returns (rc, combined_output).
+    This avoids the 'Could not connect: No such file or directory' error in containers.
+    """
+    # Ensure an XDG runtime dir; D-Bus often expects it
+    env = os.environ.copy()
+    xdg_runtime = env.get("XDG_RUNTIME_DIR", "/tmp/xdg-runtime")
+    os.makedirs(xdg_runtime, exist_ok=True)
+    try:
+        os.chmod(xdg_runtime, 0o700)
+    except Exception:
+        pass
+    env["XDG_RUNTIME_DIR"] = xdg_runtime
+
+    # Start a dedicated session bus
+    # We capture both the bus address and PID so we can clean up.
+    dbus_cmd = ["dbus-daemon", "--session", "--print-address=1", "--print-pid=1", "--fork"]
+    try:
+        # Run dbus-daemon and capture stdout (two lines: address, pid)
+        out = subprocess.check_output(dbus_cmd, env=env, text=True)
+    except Exception as e:
+        return 1, f"Failed to start dbus-daemon: {e}\n(Check that the 'dbus' package is installed.)"
+
+    lines = [ln.strip() for ln in out.strip().splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return 1, f"dbus-daemon did not print address and pid; got: {out!r}"
+    dbus_addr, dbus_pid = lines[0], lines[1]
+    env["DBUS_SESSION_BUS_ADDRESS"] = dbus_addr
+
+    # Compose PrusaSlicer command
+    # - xvfb-run provides a virtual X for GTK/OpenGL init (even with --no-gui)
+    # - --filesystem=host lets Flatpak see /profiles, /tmp, and our working dir
+    base = [
+        "xvfb-run", "-a", "-s", "-screen 0 1024x768x24",
+        "flatpak", "run", "--branch=stable", "--filesystem=host", PRUSA_FLATPAK_APP
+    ]
+    # Join into a single shell-safe command for logging and our sh() helper
+    cmd = " ".join(shlex.quote(x) for x in base + args)
+
+    try:
+        rc, log = sh(cmd, env=env)
+    finally:
+        # Tear down the session bus we started
+        try:
+            subprocess.run(["kill", "-9", dbus_pid], check=False)
+        except Exception:
+            pass
+
+    return rc, log
 
 # ---------- Health/Readiness ----------
 @app.get("/healthz")
@@ -154,26 +197,26 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             out_dir = os.path.join(wd, "out")
             os.makedirs(out_dir, exist_ok=True)
 
-            # 3) Slice with PrusaSlicer (Flatpak + Xvfb + DBus), with full FS access
+            # 3) Slice with PrusaSlicer (Flatpak + Xvfb + private D-Bus session), with full FS access
             slices_target = os.path.join(out_dir, "slices")
             os.makedirs(slices_target, exist_ok=True)
 
-            # Build base CLI (headless export)
-            base_args = (
-                f' --no-gui --export-sla --export-3mf --load "{prusa_ini}" '
-                f'--output "{out_dir}"'
-            )
+            # Build base Prusa CLI (headless export)
+            base_args = [
+                "--no-gui", "--export-sla", "--export-3mf",
+                "--load", prusa_ini,
+                "--output", out_dir,
+            ]
 
-            cmd1_options = [
-                # Preferred: explicit SLA output directory
-                f'{PRUSA_LAUNCH_PREFIX} {base_args} --sla-output "{slices_target}" "{input_model}"',
-                # Fallback: let PrusaSlicer decide; we'll discover the slices folder
-                f'{PRUSA_LAUNCH_PREFIX} {base_args} "{input_model}"',
+            # We try explicit SLA dir first, then fallback
+            cmd_variants = [
+                base_args + ["--sla-output", slices_target, input_model],
+                base_args + [input_model],
             ]
 
             rc1, log1 = -1, ""
-            for cmd in cmd1_options:
-                rc1, log1 = sh(cmd)
+            for argv in cmd_variants:
+                rc1, log1 = run_prusaslicer_headless(argv)
                 if rc1 == 0:
                     break
 
