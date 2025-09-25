@@ -1,1 +1,12 @@
+{
+  "screen_px": [4098, 2560],
+  "pixel_um": 35,
+  "volume_mm": [143, 89, 175],
+  "exposure_s": 2.5,
+  "bottom_exposure_s": 30,
+  "bottom_layers": 6,
+  "lift_mm": 6,
+  "lift_speed": 80,
+  "retract_speed": 100
+}
 
