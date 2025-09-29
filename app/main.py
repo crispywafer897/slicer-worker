@@ -1,7 +1,8 @@
-import os, subprocess, shutil, json, tempfile, zipfile, urllib.request, glob, shlex
-from typing import Dict, Any, Optional
+import os, subprocess, shutil, json, tempfile, zipfile, urllib.request, glob, shlex, hashlib, textwrap
+from pathlib import Path
+from typing import Dict, Any, Optional, Tuple
 
-from fastapi import FastAPI, Header
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from supabase import create_client, Client
 
@@ -10,11 +11,25 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 WORKER_TOKEN = os.getenv("WORKER_TOKEN", "")
 
+# Storage bucket that holds bundles/ and uvtools_params/
+STORAGE_BUCKET = os.environ.get("STORAGE_BUCKET", "slicer-presets")
+
+# Ephemeral cache dir for downloaded bundles/params on warm instances
+CACHE_DIR = Path(os.environ.get("CACHE_DIR", "/tmp/preset_cache"))
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
 # Where the AppImage symlink was installed by your Dockerfile (extracted AppRun)
 PRUSA_APPIMAGE = "/usr/local/bin/prusaslicer"
 
-# Acceptable model file extensions PrusaSlicer can ingest headlessly here
+# Acceptable model file extensions PrusaSlicer can ingest headlessly
 ALLOWED_MODEL_EXTS = {".stl", ".3mf", ".obj", ".amf"}
+
+# Allow-list of UVtools param keys that jobs may override safely
+ALLOWLIST_OVERRIDE_KEYS = {
+    "layer_height_mm", "bottom_layers", "bottom_exposure_s", "normal_exposure_s",
+    "light_off_delay_s", "lift_height_mm", "lift_speed_mm_s", "retract_speed_mm_s",
+    "anti_aliasing"
+}
 
 app = FastAPI()
 
@@ -24,32 +39,9 @@ def _supabase() -> Client:
         raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-# ---------- Small helpers to guess preset names ----------
-def guess_printer_preset_name(printer_id: str) -> str:
-    """
-    Map your printer_id (e.g., 'elegoo_mars3') to the likely PrusaSlicer printer preset name.
-    Tweak this mapping as needed if your AppImage shows different names under SLA printers.
-    """
-    # Basic title-casing & vendors (extend as you add printers)
-    mapping = {
-        "elegoo_mars3": "Elegoo Mars 3",
-    }
-    return mapping.get(printer_id, printer_id.replace("_", " ").title())
-
-def guess_profile_display_name(profile_id: str) -> str:
-    """
-    Map '0.05mm_standard' -> '0.05 mm Standard' (insert space before 'mm' and title-case).
-    Used for both --print-profile and --material-profile when names match.
-    """
-    s = profile_id.strip().replace("_", " ")
-    s = s.replace("mm", " mm")
-    # Fix duplicate spaces if any
-    s = " ".join(s.split())
-    return s.title()
-
 # ---------- Utilities ----------
-def sh(cmd: str, cwd: Optional[str] = None, env: Optional[dict] = None):
-    """Run a shell command and capture output."""
+def sh(cmd: str, cwd: Optional[str] = None, env: Optional[dict] = None) -> Tuple[int, str]:
+    """Run a shell command and capture combined stdout+stderr."""
     p = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, env=env)
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
@@ -96,6 +88,55 @@ def find_layers(base_dir: str) -> Optional[str]:
             best_dir, best_count = root, count
     return best_dir if best_count > 0 else None
 
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _download_storage(object_path: str, dest: Path):
+    """Download a private object from Supabase Storage to dest."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    data = _supabase().storage.from_(STORAGE_BUCKET).download(object_path)
+    dest.write_bytes(data)
+
+def resolve_preset(printer_id: str) -> Dict[str, Any]:
+    """
+    Fetch a printer preset row from DB, and ensure bundle/params are cached locally.
+    Table: public.printer_presets
+    """
+    res = _supabase().table("printer_presets").select("*").eq("id", printer_id).single().execute()
+    row = res.data
+    if not row:
+        raise HTTPException(status_code=400, detail=f"Unknown printer_id={printer_id}")
+
+    bundle_cached = CACHE_DIR / row["bundle_path"].replace("/", "__")
+    params_cached = CACHE_DIR / row["uvtools_params_path"].replace("/", "__")
+
+    if not bundle_cached.exists():
+        _download_storage(row["bundle_path"], bundle_cached)
+    if not params_cached.exists():
+        _download_storage(row["uvtools_params_path"], params_cached)
+
+    # Optional integrity check
+    if row.get("bundle_sha256"):
+        actual = _sha256(bundle_cached)
+        if actual != row["bundle_sha256"]:
+            raise HTTPException(status_code=400, detail=f"Bundle sha256 mismatch: expected {row['bundle_sha256']} got {actual}")
+
+    return {"row": row, "bundle_local": str(bundle_cached), "params_local": str(params_cached)}
+
+def merge_overrides(params_path: Path, overrides: Optional[Dict[str, Any]]) -> Path:
+    """Allow-list merge of job overrides into UVtools params JSON."""
+    params = json.loads(Path(params_path).read_text())
+    for k, v in (overrides or {}).items():
+        if k in ALLOWLIST_OVERRIDE_KEYS:
+            params[k] = v
+    merged_path = Path(params_path).parent / (Path(params_path).stem + ".merged.json")
+    merged_path.write_text(json.dumps(params))
+    return merged_path
+
 # ---------- PrusaSlicer runner (AppImage, headless) ----------
 def run_prusaslicer_headless(args: list[str]) -> tuple[int, str, str]:
     """
@@ -123,6 +164,7 @@ def ready():
         "has_SUPABASE_URL": bool(SUPABASE_URL),
         "has_SERVICE_ROLE": bool(SUPABASE_SERVICE_ROLE_KEY),
         "has_WORKER_TOKEN": bool(WORKER_TOKEN),
+        "storage_bucket": STORAGE_BUCKET,
     }
 
 # ---------- Main job endpoint ----------
@@ -173,115 +215,114 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             _, ext = os.path.splitext(base_name)
             ext = ext.lower()
             if ext not in ALLOWED_MODEL_EXTS:
-                update_job(job_id, status="failed",
-                           error=f"unsupported_model_extension: {ext or '(none)'}; "
-                                 f"expected one of {sorted(ALLOWED_MODEL_EXTS)}; "
-                                 f"path was: {path_in_bucket}")
+                update_job(
+                    job_id,
+                    status="failed",
+                    error=f"unsupported_model_extension: {ext or '(none)'}; expected one of {sorted(ALLOWED_MODEL_EXTS)}; path was: {path_in_bucket}"
+                )
                 return {"ok": False, "error": "unsupported_model_extension"}
 
             input_model = os.path.join(wd, base_name)
             signed_download(bucket, path_in_bucket, input_model)
 
-            # 2) Profiles (robust path resolution + validation + debug)
-            printer_id_raw    = job.get("printer_id", "")
-            print_profile_raw = job.get("print_profile", "")
+            # 2) Resolve preset row (DB) and fetch bundle/params (Storage) to local cache
+            printer_id_raw = job.get("printer_id", "")
+            if not printer_id_raw:
+                update_job(job_id, status="failed", error="missing printer_id")
+                return {"ok": False, "error": "missing_printer_id"}
 
             printer_id = printer_id_raw.strip().lower().replace(" ", "_")
-            print_profile = print_profile_raw.strip()
+            try:
+                preset = resolve_preset(printer_id)
+            except HTTPException as he:
+                update_job(job_id, status="failed", error=f"preset_resolve_failed: {he.detail}")
+                return {"ok": False, "error": "preset_resolve_failed"}
 
-            # Expected repo layout:
-            #   /profiles/printers/elegoo_mars3.json
-            #   /profiles/resin_presets/0.05mm_standard.ini
-            #   /profiles/uvtools_params/elegoo_mars3_std_resin.json
-            printer_json   = os.path.join("/profiles", "printers", f"{printer_id}.json")
-            ini_name       = print_profile if print_profile.endswith(".ini") else print_profile + ".ini"
-            prusa_ini      = os.path.join("/profiles", "resin_presets", ini_name)
-            uvtools_params = os.path.join("/profiles", "uvtools_params", f"{printer_id}_std_resin.json")
+            row = preset["row"]
+            bundle_local = preset["bundle_local"]
+            params_local = preset["params_local"]
 
-            # Helpful debug on path issues (fail fast here, not during slicing)
-            missing = []
-            for req_path, label in [(printer_json, "printer profile"),
-                                    (prusa_ini, "resin preset"),
-                                    (uvtools_params, "uvtools params")]:
-                if not os.path.exists(req_path):
-                    missing.append(f"{label}: {req_path}")
-            if missing:
-                update_job(job_id, status="failed",
-                           error="missing_profile_assets: " + " | ".join(missing))
-                return {"ok": False, "error": "missing_profile_assets"}
-
-            out_dir = os.path.join(wd, "out")
-            os.makedirs(out_dir, exist_ok=True)
-
-            # 2b) Preflight: ensure PrusaSlicer binary is runnable; don't fail hard on rc alone
+            # 2b) Preflight: ensure PrusaSlicer binary is runnable
             rc0, log0, cmd0 = run_prusaslicer_headless(["--version"])
             if ("PrusaSlicer" not in log0) and (rc0 != 0):
-                update_job(job_id, status="failed",
-                           error=f"prusaslicer_boot_failed rc={rc0}\nCMD: {cmd0}\n{log0[-4000:]}")
+                update_job(job_id, status="failed", error=f"prusaslicer_boot_failed rc={rc0}\nCMD: {cmd0}\n{log0[-4000:]}")
                 return {"ok": False, "error": "prusaslicer_boot_failed"}
 
-            # 3) Slice with PrusaSlicer (AppImage headless) — use --datadir, and specify profiles by *name*
+            # 3) Slice with PrusaSlicer (AppImage headless) — use --load bundle and exact preset names
             conf_dir = os.path.join(wd, "ps_config")
+            out_dir = os.path.join(wd, "out")
             os.makedirs(conf_dir, exist_ok=True)
+            os.makedirs(out_dir, exist_ok=True)
 
-            printer_name = guess_printer_preset_name(printer_id)          # e.g., "Elegoo Mars 3"
-            profile_name = guess_profile_display_name(print_profile)      # e.g., "0.05 mm Standard"
+            printer_name = row["printer_profile_name"]
+            print_profile = job.get("print_profile") or row["print_profile_name"]
+            material_profile = job.get("material_profile") or row["material_profile_name"]
 
-            # We'll try multiple variants, from strictest (with --load) to loosest (names only).
             base_common = [
                 "--no-gui",
                 "--export-sla",
                 "--datadir", conf_dir,
                 "--loglevel", "3",
+                "--output", out_dir,  # let find_layers() discover final PNG dir
             ]
 
-            variants = [
-                # 1) ini + explicit printer & material profile names
-                base_common + ["--load", prusa_ini, "--printer-profile", printer_name, "--material-profile", profile_name, input_model],
-                # 2) ini + printer + material + print profile (if SLA print profile is named the same)
-                base_common + ["--load", prusa_ini, "--printer-profile", printer_name, "--material-profile", profile_name, "--print-profile", profile_name, input_model],
-                # 3) names only: printer + material
-                base_common + ["--printer-profile", printer_name, "--material-profile", profile_name, input_model],
-                # 4) names only: printer + material + print
-                base_common + ["--printer-profile", printer_name, "--material-profile", profile_name, "--print-profile", profile_name, input_model],
+            # Strict single attempt with --load + explicit names (preferred)
+            argv = base_common + [
+                "--load", bundle_local,
+                "--printer-profile", printer_name,
+                "--print-profile", print_profile,
+                "--material-profile", material_profile,
+                input_model
             ]
 
-            rc1, log1, cmd1 = -1, "", ""
-            for argv in variants:
-                rc1, log1, cmd1 = run_prusaslicer_headless(argv)
-                if rc1 == 0:
-                    break
-
+            rc1, log1, cmd1 = run_prusaslicer_headless(argv)
             if rc1 != 0:
-                # As a last resort, capture PrusaSlicer's own SLA help into the logs for exact guidance
+                # Capture SLA help to include exact flags for this version
                 rc_help, log_help, cmd_help = run_prusaslicer_headless(["--help-sla"])
-                update_job(job_id, status="failed",
-                           error=f"prusaslicer_failed rc={rc1}\nCMD: {cmd1}\n{log1[-3000:]}\n\n--help-sla (rc={rc_help})\n{log_help[-3000:]}")
+                update_job(
+                    job_id,
+                    status="failed",
+                    error=textwrap.dedent(f"""prusaslicer_failed rc={rc1}
+CMD: {cmd1}
+printer_id: {printer_id}
+bundle: {row['bundle_path']}  params: {row['uvtools_params_path']}
+presets:
+  printer={printer_name}
+  print={print_profile}
+  material={material_profile}
+--- STDOUT/ERR (tail) ---
+{(log1 or '')[-4000:]}
+--help-sla (rc={rc_help}) tail:
+{(log_help or '')[-2000:]}
+""")
+                )
                 return {"ok": False, "error": "prusaslicer_failed"}
 
             # 3b) Find where PNG layers actually went (discover; don't assume path)
             slices_dir = find_layers(out_dir)
             if not slices_dir:
-                update_job(job_id, status="failed",
-                           error=f"no_slices_found in {out_dir}.\nCMD: {cmd1}\nPrusa log tail:\n{log1[-4000:]}")
+                update_job(job_id, status="failed", error=f"no_slices_found in {out_dir}.\nCMD: {cmd1}\nPrusa log tail:\n{(log1 or '')[-4000:]}")
                 return {"ok": False, "error": "no_slices_found"}
 
-            # 4) Package with UVtools
-            with open(printer_json, "r") as f:
-                fmt = json.load(f)["format"]  # e.g., "ctb_v3"
-            native_ext = "ctb" if "ctb" in fmt else "cbddlp"
+            # 4) Package with UVtools (pack PNG stack to native resin format)
+            # Merge overrides (safe keys only) into UVtools params
+            merged_params_path = merge_overrides(Path(params_local), job.get("overrides"))
+            native_format = row["native_format"]  # e.g., 'pwmx', 'ctb_v3', ...
+            native_ext = native_format if native_format.startswith("ctb") or native_format.startswith("pwm") else native_format
             native_path = os.path.join(out_dir, f"print.{native_ext}")
 
-            cmd2 = (
-                f'uvtools-cli pack --format {fmt} '
-                f'--printer-profile "{printer_json}" '
-                f'--slices "{slices_dir}" '
-                f'--params "{uvtools_params}" '
-                f'--out "{native_path}"'
-            )
+            # We avoid --printer-profile (we're packing from images with explicit params)
+            cmd2_list = [
+                "uvtools-cli", "pack",
+                "--format", native_format,
+                "--params", merged_params_path,
+                "--slices", slices_dir,
+                "--out", native_path
+            ]
+            cmd2 = " ".join(shlex.quote(str(x)) for x in cmd2_list)
             rc2, log2 = sh(cmd2)
             if rc2 != 0:
-                update_job(job_id, status="failed", error=f"uvtools_failed rc={rc2}\n{log2[-4000:]}")
+                update_job(job_id, status="failed", error=f"uvtools_failed rc={rc2}\n{(log2 or '')[-4000:]}")
                 return {"ok": False, "error": "uvtools_failed"}
 
             # 5) Zip layers (for download/debug)
@@ -293,14 +334,17 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             # 6) Upload outputs
             job_prefix = str(job_id)
 
-            def up(bucket, path, local, ctype):
+            def up(bucket_name: str, path: str, local: str, ctype: str):
                 with open(local, "rb") as f:
-                    _supabase().storage.from_(bucket).upload(path, f, {"content-type": ctype, "upsert": True})
+                    _supabase().storage.from_(bucket_name).upload(path, f, {"content-type": ctype, "upsert": True})
 
+            # Native
             up("native",   f"{job_prefix}/print.{native_ext}", native_path, "application/octet-stream")
+            # Optional project (.3mf) if PrusaSlicer happened to create one
             proj = next((f for f in os.listdir(out_dir) if f.endswith(".3mf")), None)
             if proj:
                 up("projects", f"{job_prefix}/{proj}", os.path.join(out_dir, proj), "model/3mf")
+            # Layers zip
             up("slices",   f"{job_prefix}/layers.zip", zip_path, "application/zip")
 
             # 7) Finalize
