@@ -10,8 +10,8 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 WORKER_TOKEN = os.getenv("WORKER_TOKEN", "")
 
-# Where the AppImage symlink was installed by your Dockerfile
-PRUSA_APPIMAGE = "/usr/local/bin/prusaslicer"  # symlink to /opt/PrusaSlicer.AppImage (extracted)
+# Where the AppImage symlink was installed by your Dockerfile (extracted AppRun)
+PRUSA_APPIMAGE = "/usr/local/bin/prusaslicer"
 
 app = FastAPI()
 
