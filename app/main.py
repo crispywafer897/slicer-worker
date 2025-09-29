@@ -13,6 +13,9 @@ WORKER_TOKEN = os.getenv("WORKER_TOKEN", "")
 # Where the AppImage symlink was installed by your Dockerfile (extracted AppRun)
 PRUSA_APPIMAGE = "/usr/local/bin/prusaslicer"
 
+# Acceptable model file extensions PrusaSlicer can ingest headlessly here
+ALLOWED_MODEL_EXTS = {".stl", ".3mf", ".obj", ".amf"}
+
 app = FastAPI()
 
 # Lazily create Supabase client (so missing envs don't crash import)
@@ -71,18 +74,19 @@ def find_layers(base_dir: str) -> Optional[str]:
     return best_dir if best_count > 0 else None
 
 # ---------- PrusaSlicer runner (AppImage, headless) ----------
-def run_prusaslicer_headless(args: list[str]) -> tuple[int, str]:
+def run_prusaslicer_headless(args: list[str]) -> tuple[int, str, str]:
     """
-    Run PrusaSlicer AppImage headlessly.
-    We keep xvfb-run to satisfy GTK/OpenGL init even with --no-gui.
+    Run PrusaSlicer AppImage headlessly with xvfb-run.
+    Returns (rc, combined_output, rendered_command_str) for better error logs.
     """
     env = os.environ.copy()
-    # Prevent GTK from probing the accessibility D-Bus (pairs with NO_AT_BRIDGE=1 in Dockerfile)
-    env.setdefault("NO_AT_BRIDGE", "1")
+    env.setdefault("NO_AT_BRIDGE", "1")  # avoid a11y D-Bus probing
 
     base = ["xvfb-run", "-a", "-s", "-screen 0 1024x768x24", PRUSA_APPIMAGE]
-    cmd = " ".join(shlex.quote(x) for x in base + args)
-    return sh(cmd, env=env)
+    cmd_list = base + args
+    cmd_str = " ".join(shlex.quote(x) for x in cmd_list)
+    rc, log = sh(cmd_str, env=env)
+    return rc, log, cmd_str
 
 # ---------- Health/Readiness ----------
 @app.get("/healthz")
@@ -139,9 +143,21 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             if ":" not in in_spec:
                 update_job(job_id, status="failed", error=f"bad_input_path_format (expected 'bucket:path'): {in_spec}")
                 return {"ok": False, "error": "bad_input_path_format"}
-            bucket, path = in_spec.split(":", 1)
-            input_model = os.path.join(wd, "model.input")  # Prusa accepts STL/3MF; generic name ok
-            signed_download(bucket, path, input_model)
+            bucket, path_in_bucket = in_spec.split(":", 1)
+
+            # Preserve the original filename & extension — PrusaSlicer relies on the extension
+            base_name = os.path.basename(path_in_bucket)
+            _, ext = os.path.splitext(base_name)
+            ext = ext.lower()
+            if ext not in ALLOWED_MODEL_EXTS:
+                update_job(job_id, status="failed",
+                           error=f"unsupported_model_extension: {ext or '(none)'}; "
+                                 f"expected one of {sorted(ALLOWED_MODEL_EXTS)}; "
+                                 f"path was: {path_in_bucket}")
+                return {"ok": False, "error": "unsupported_model_extension"}
+
+            input_model = os.path.join(wd, base_name)
+            signed_download(bucket, path_in_bucket, input_model)
 
             # 2) Profiles (robust path resolution + validation + debug)
             printer_id_raw    = job.get("printer_id", "")
@@ -175,10 +191,10 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             os.makedirs(out_dir, exist_ok=True)
 
             # 2b) Preflight: ensure PrusaSlicer binary is runnable; don't fail hard on rc alone
-            rc0, log0 = run_prusaslicer_headless(["--version"])
+            rc0, log0, cmd0 = run_prusaslicer_headless(["--version"])
             if ("PrusaSlicer" not in log0) and (rc0 != 0):
                 update_job(job_id, status="failed",
-                           error=f"prusaslicer_boot_failed rc={rc0}\n{log0[-4000:]}")
+                           error=f"prusaslicer_boot_failed rc={rc0}\nCMD: {cmd0}\n{log0[-4000:]}")
                 return {"ok": False, "error": "prusaslicer_boot_failed"}
 
             # 3) Slice with PrusaSlicer (AppImage headless) — use --datadir, NOT --output
@@ -194,27 +210,29 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 "--export-sla",
                 "--load", prusa_ini,
                 "--datadir", conf_dir,
+                "--loglevel", "3"
             ]
             cmd_variants = [
                 base_args + ["--sla-output", slices_target, input_model],  # try explicit SLA dir
                 base_args + [input_model],                                  # fallback to defaults
             ]
 
-            rc1, log1 = -1, ""
+            rc1, log1, cmd1 = -1, "", ""
             for argv in cmd_variants:
-                rc1, log1 = run_prusaslicer_headless(argv)
+                rc1, log1, cmd1 = run_prusaslicer_headless(argv)
                 if rc1 == 0:
                     break
 
             if rc1 != 0:
-                update_job(job_id, status="failed", error=f"prusaslicer_failed rc={rc1}\n{log1[-4000:]}")
+                update_job(job_id, status="failed",
+                           error=f"prusaslicer_failed rc={rc1}\nCMD: {cmd1}\n{log1[-4000:]}")
                 return {"ok": False, "error": "prusaslicer_failed"}
 
             # 3b) Find where PNG layers actually went (discover; don't assume path)
             slices_dir = find_layers(out_dir)
             if not slices_dir:
                 update_job(job_id, status="failed",
-                           error=f"no_slices_found in {out_dir}. Prusa log tail:\n{log1[-4000:]}")
+                           error=f"no_slices_found in {out_dir}.\nCMD: {cmd1}\nPrusa log tail:\n{log1[-4000:]}")
                 return {"ok": False, "error": "no_slices_found"}
 
             # 4) Package with UVtools
