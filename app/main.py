@@ -24,6 +24,29 @@ def _supabase() -> Client:
         raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
+# ---------- Small helpers to guess preset names ----------
+def guess_printer_preset_name(printer_id: str) -> str:
+    """
+    Map your printer_id (e.g., 'elegoo_mars3') to the likely PrusaSlicer printer preset name.
+    Tweak this mapping as needed if your AppImage shows different names under SLA printers.
+    """
+    # Basic title-casing & vendors (extend as you add printers)
+    mapping = {
+        "elegoo_mars3": "Elegoo Mars 3",
+    }
+    return mapping.get(printer_id, printer_id.replace("_", " ").title())
+
+def guess_profile_display_name(profile_id: str) -> str:
+    """
+    Map '0.05mm_standard' -> '0.05 mm Standard' (insert space before 'mm' and title-case).
+    Used for both --print-profile and --material-profile when names match.
+    """
+    s = profile_id.strip().replace("_", " ")
+    s = s.replace("mm", " mm")
+    # Fix duplicate spaces if any
+    s = " ".join(s.split())
+    return s.title()
+
 # ---------- Utilities ----------
 def sh(cmd: str, cwd: Optional[str] = None, env: Optional[dict] = None):
     """Run a shell command and capture output."""
@@ -145,8 +168,8 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 return {"ok": False, "error": "bad_input_path_format"}
             bucket, path_in_bucket = in_spec.split(":", 1)
 
-            # Preserve the original filename & extension — PrusaSlicer relies on the extension
-            base_name = os.path.basename(path_in_bucket)
+            # Preserve original filename & extension — PrusaSlicer relies on the extension
+            base_name = os.path.basename(path_in_bucket.split("?")[0])
             _, ext = os.path.splitext(base_name)
             ext = ext.lower()
             if ext not in ALLOWED_MODEL_EXTS:
@@ -197,35 +220,43 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                            error=f"prusaslicer_boot_failed rc={rc0}\nCMD: {cmd0}\n{log0[-4000:]}")
                 return {"ok": False, "error": "prusaslicer_boot_failed"}
 
-            # 3) Slice with PrusaSlicer (AppImage headless) — use --datadir, NOT --output
-            slices_target = os.path.join(out_dir, "slices")  # preferred target when supported
-            os.makedirs(slices_target, exist_ok=True)
-
-            # Use a private config/state dir so PrusaSlicer doesn't touch $HOME
+            # 3) Slice with PrusaSlicer (AppImage headless) — use --datadir, and specify profiles by *name*
             conf_dir = os.path.join(wd, "ps_config")
             os.makedirs(conf_dir, exist_ok=True)
 
-            base_args = [
+            printer_name = guess_printer_preset_name(printer_id)          # e.g., "Elegoo Mars 3"
+            profile_name = guess_profile_display_name(print_profile)      # e.g., "0.05 mm Standard"
+
+            # We'll try multiple variants, from strictest (with --load) to loosest (names only).
+            base_common = [
                 "--no-gui",
                 "--export-sla",
-                "--load", prusa_ini,
                 "--datadir", conf_dir,
-                "--loglevel", "3"
+                "--loglevel", "3",
             ]
-            cmd_variants = [
-                base_args + ["--sla-output", slices_target, input_model],  # try explicit SLA dir
-                base_args + [input_model],                                  # fallback to defaults
+
+            variants = [
+                # 1) ini + explicit printer & material profile names
+                base_common + ["--load", prusa_ini, "--printer-profile", printer_name, "--material-profile", profile_name, input_model],
+                # 2) ini + printer + material + print profile (if SLA print profile is named the same)
+                base_common + ["--load", prusa_ini, "--printer-profile", printer_name, "--material-profile", profile_name, "--print-profile", profile_name, input_model],
+                # 3) names only: printer + material
+                base_common + ["--printer-profile", printer_name, "--material-profile", profile_name, input_model],
+                # 4) names only: printer + material + print
+                base_common + ["--printer-profile", printer_name, "--material-profile", profile_name, "--print-profile", profile_name, input_model],
             ]
 
             rc1, log1, cmd1 = -1, "", ""
-            for argv in cmd_variants:
+            for argv in variants:
                 rc1, log1, cmd1 = run_prusaslicer_headless(argv)
                 if rc1 == 0:
                     break
 
             if rc1 != 0:
+                # As a last resort, capture PrusaSlicer's own SLA help into the logs for exact guidance
+                rc_help, log_help, cmd_help = run_prusaslicer_headless(["--help-sla"])
                 update_job(job_id, status="failed",
-                           error=f"prusaslicer_failed rc={rc1}\nCMD: {cmd1}\n{log1[-4000:]}")
+                           error=f"prusaslicer_failed rc={rc1}\nCMD: {cmd1}\n{log1[-3000:]}\n\n--help-sla (rc={rc_help})\n{log_help[-3000:]}")
                 return {"ok": False, "error": "prusaslicer_failed"}
 
             # 3b) Find where PNG layers actually went (discover; don't assume path)
