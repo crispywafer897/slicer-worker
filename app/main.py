@@ -235,16 +235,20 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 "--loglevel", "3",
             ]
 
-            variants = [
-                # 1) ini + explicit printer & material profile names
-                base_common + ["--load", prusa_ini, "--printer-profile", printer_name, "--material-profile", profile_name, input_model],
-                # 2) ini + printer + material + print profile (if SLA print profile is named the same)
-                base_common + ["--load", prusa_ini, "--printer-profile", printer_name, "--material-profile", profile_name, "--print-profile", profile_name, input_model],
-                # 3) names only: printer + material
-                base_common + ["--printer-profile", printer_name, "--material-profile", profile_name, input_model],
-                # 4) names only: printer + material + print
-                base_common + ["--printer-profile", printer_name, "--material-profile", profile_name, "--print-profile", profile_name, input_model],
-            ]
+        # ---------- TEMPORARY SMOKE TEST (built-in printer) ----------
+# Try a built-in Prusa SLA printer to prove the pipeline. If this succeeds,
+# your pipeline is good and the issue is just missing presets for Elegoo.
+builtin_printer = "Original Prusa SL1S SPEED"  # known built-in
+variants = [
+    base_common + ["--printer-profile", builtin_printer, input_model],
+]
+rc1, log1, cmd1 = run_prusaslicer_headless(variants[0])
+if rc1 != 0:
+    update_job(job_id, status="failed",
+               error=f"prusaslicer_failed (builtin smoke test) rc={rc1}\nCMD: {cmd1}\n{log1[-3000:]}")
+    return {"ok": False, "error": "prusaslicer_failed"}
+# ---------- END TEMPORARY SMOKE TEST ----------
+
 
             rc1, log1, cmd1 = -1, "", ""
             for argv in variants:
