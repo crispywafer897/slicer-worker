@@ -11,7 +11,7 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 WORKER_TOKEN = os.getenv("WORKER_TOKEN", "")
 
 # Where the AppImage symlink was installed by your Dockerfile
-PRUSA_APPIMAGE = "/usr/local/bin/prusaslicer"  # symlink to /opt/PrusaSlicer.AppImage
+PRUSA_APPIMAGE = "/usr/local/bin/prusaslicer"  # symlink to /opt/PrusaSlicer.AppImage (extracted)
 
 app = FastAPI()
 
@@ -150,8 +150,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             printer_id = printer_id_raw.strip().lower().replace(" ", "_")
             print_profile = print_profile_raw.strip()
 
-            # Build absolute paths (you COPY profiles /profiles in the Dockerfile)
-            # Expected repo layout (per your message):
+            # Expected repo layout:
             #   /profiles/printers/elegoo_mars3.json
             #   /profiles/resin_presets/0.05mm_standard.ini
             #   /profiles/uvtools_params/elegoo_mars3_std_resin.json
@@ -175,25 +174,30 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             out_dir = os.path.join(wd, "out")
             os.makedirs(out_dir, exist_ok=True)
 
-            # 2b) Preflight: can PrusaSlicer run at all? (rules out runtime issues vs. path issues)
+            # 2b) Preflight: ensure PrusaSlicer binary is runnable; don't fail hard on rc alone
             rc0, log0 = run_prusaslicer_headless(["--version"])
-            if rc0 != 0:
+            if ("PrusaSlicer" not in log0) and (rc0 != 0):
                 update_job(job_id, status="failed",
                            error=f"prusaslicer_boot_failed rc={rc0}\n{log0[-4000:]}")
                 return {"ok": False, "error": "prusaslicer_boot_failed"}
 
-            # 3) Slice with PrusaSlicer (AppImage headless)
-            slices_target = os.path.join(out_dir, "slices")
+            # 3) Slice with PrusaSlicer (AppImage headless) — use --datadir, NOT --output
+            slices_target = os.path.join(out_dir, "slices")  # preferred target when supported
             os.makedirs(slices_target, exist_ok=True)
 
+            # Use a private config/state dir so PrusaSlicer doesn't touch $HOME
+            conf_dir = os.path.join(wd, "ps_config")
+            os.makedirs(conf_dir, exist_ok=True)
+
             base_args = [
-                "--no-gui", "--export-sla", "--export-3mf",
+                "--no-gui",
+                "--export-sla",
                 "--load", prusa_ini,
-                "--output", out_dir,
+                "--datadir", conf_dir,
             ]
             cmd_variants = [
-                base_args + ["--sla-output", slices_target, input_model],  # prefer explicit SLA dir
-                base_args + [input_model],                                  # fallback
+                base_args + ["--sla-output", slices_target, input_model],  # try explicit SLA dir
+                base_args + [input_model],                                  # fallback to defaults
             ]
 
             rc1, log1 = -1, ""
@@ -206,7 +210,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 update_job(job_id, status="failed", error=f"prusaslicer_failed rc={rc1}\n{log1[-4000:]}")
                 return {"ok": False, "error": "prusaslicer_failed"}
 
-            # 3b) Find where PNG layers actually went
+            # 3b) Find where PNG layers actually went (discover; don't assume path)
             slices_dir = find_layers(out_dir)
             if not slices_dir:
                 update_job(job_id, status="failed",
