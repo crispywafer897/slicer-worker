@@ -10,6 +10,9 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 WORKER_TOKEN = os.getenv("WORKER_TOKEN", "")
 
+# Where the AppImage symlink was installed by your Dockerfile
+PRUSA_APPIMAGE = "/usr/local/bin/prusaslicer"  # symlink to /opt/PrusaSlicer.AppImage
+
 app = FastAPI()
 
 # Lazily create Supabase client (so missing envs don't crash import)
@@ -67,31 +70,17 @@ def find_layers(base_dir: str) -> Optional[str]:
             best_dir, best_count = root, count
     return best_dir if best_count > 0 else None
 
-# ---------- PrusaSlicer runner (Flatpak in headless container, no D-Bus) ----------
-PRUSA_FLATPAK_APP = "com.prusa3d.PrusaSlicer"
-
+# ---------- PrusaSlicer runner (AppImage, headless) ----------
 def run_prusaslicer_headless(args: list[str]) -> tuple[int, str]:
     """
-    Run PrusaSlicer Flatpak headlessly *without* a session D-Bus:
-      - disable session bus:    flatpak run --no-session-bus
-      - disable a11y bus:       NO_AT_BRIDGE=1
-      - headless X:             xvfb-run
-      - sandbox perms:          --filesystem=host --socket=x11
-    Returns (rc, combined_output).
+    Run PrusaSlicer AppImage headlessly.
+    We keep xvfb-run to satisfy GTK/OpenGL init even with --no-gui.
     """
     env = os.environ.copy()
-    env["NO_AT_BRIDGE"] = "1"  # prevent GTK from touching the accessibility bus
+    # Prevent GTK from probing the accessibility D-Bus (pairs with NO_AT_BRIDGE=1 in Dockerfile)
+    env.setdefault("NO_AT_BRIDGE", "1")
 
-    base = [
-        "xvfb-run", "-a", "-s", "-screen 0 1024x768x24",
-        "flatpak", "run",
-        "--branch=stable",
-        "--no-session-bus",      # <-- avoid needing DBus session entirely
-        "--filesystem=host",     # see /profiles, /tmp, and job workdir
-        "--socket=x11",          # allow Xvfb X11
-        PRUSA_FLATPAK_APP
-    ]
-
+    base = ["xvfb-run", "-a", "-s", "-screen 0 1024x768x24", PRUSA_APPIMAGE]
     cmd = " ".join(shlex.quote(x) for x in base + args)
     return sh(cmd, env=env)
 
@@ -148,29 +137,52 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             # 1) Input model (spec is "bucket:path/in/bucket.ext")
             in_spec = job["input_path"]
             if ":" not in in_spec:
-                raise ValueError(f"input_path must be 'bucket:path', got: {in_spec}")
+                update_job(job_id, status="failed", error=f"bad_input_path_format (expected 'bucket:path'): {in_spec}")
+                return {"ok": False, "error": "bad_input_path_format"}
             bucket, path = in_spec.split(":", 1)
-            # Keep name generic; Prusa can import STL/3MF
-            input_model = os.path.join(wd, "model.input")
+            input_model = os.path.join(wd, "model.input")  # Prusa accepts STL/3MF; generic name ok
             signed_download(bucket, path, input_model)
 
-            # 2) Profiles
-            printer_id     = job["printer_id"]
-            print_profile  = job["print_profile"]
-            printer_json   = f"/profiles/printers/{printer_id}.json"
-            prusa_ini      = f"/profiles/resin_presets/{'0.05mm_standard.ini' if print_profile == '0.05mm_standard' else print_profile + '.ini'}"
-            uvtools_params = f"/profiles/uvtools_params/{printer_id}_std_resin.json"
+            # 2) Profiles (robust path resolution + validation + debug)
+            printer_id_raw    = job.get("printer_id", "")
+            print_profile_raw = job.get("print_profile", "")
 
+            printer_id = printer_id_raw.strip().lower().replace(" ", "_")
+            print_profile = print_profile_raw.strip()
+
+            # Build absolute paths (you COPY profiles /profiles in the Dockerfile)
+            # Expected repo layout (per your message):
+            #   /profiles/printers/elegoo_mars3.json
+            #   /profiles/resin_presets/0.05mm_standard.ini
+            #   /profiles/uvtools_params/elegoo_mars3_std_resin.json
+            printer_json   = os.path.join("/profiles", "printers", f"{printer_id}.json")
+            ini_name       = print_profile if print_profile.endswith(".ini") else print_profile + ".ini"
+            prusa_ini      = os.path.join("/profiles", "resin_presets", ini_name)
+            uvtools_params = os.path.join("/profiles", "uvtools_params", f"{printer_id}_std_resin.json")
+
+            # Helpful debug on path issues (fail fast here, not during slicing)
+            missing = []
             for req_path, label in [(printer_json, "printer profile"),
                                     (prusa_ini, "resin preset"),
                                     (uvtools_params, "uvtools params")]:
                 if not os.path.exists(req_path):
-                    raise FileNotFoundError(f"missing {label}: {req_path}")
+                    missing.append(f"{label}: {req_path}")
+            if missing:
+                update_job(job_id, status="failed",
+                           error="missing_profile_assets: " + " | ".join(missing))
+                return {"ok": False, "error": "missing_profile_assets"}
 
             out_dir = os.path.join(wd, "out")
             os.makedirs(out_dir, exist_ok=True)
 
-            # 3) Slice with PrusaSlicer (Flatpak headless, without D-Bus)
+            # 2b) Preflight: can PrusaSlicer run at all? (rules out runtime issues vs. path issues)
+            rc0, log0 = run_prusaslicer_headless(["--version"])
+            if rc0 != 0:
+                update_job(job_id, status="failed",
+                           error=f"prusaslicer_boot_failed rc={rc0}\n{log0[-4000:]}")
+                return {"ok": False, "error": "prusaslicer_boot_failed"}
+
+            # 3) Slice with PrusaSlicer (AppImage headless)
             slices_target = os.path.join(out_dir, "slices")
             os.makedirs(slices_target, exist_ok=True)
 
@@ -202,7 +214,8 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 return {"ok": False, "error": "no_slices_found"}
 
             # 4) Package with UVtools
-            fmt = json.load(open(printer_json))["format"]  # e.g., "ctb_v3"
+            with open(printer_json, "r") as f:
+                fmt = json.load(f)["format"]  # e.g., "ctb_v3"
             native_ext = "ctb" if "ctb" in fmt else "cbddlp"
             native_path = os.path.join(out_dir, f"print.{native_ext}")
 
