@@ -5,6 +5,13 @@ from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse
 from supabase import create_client, Client
 
+# ---------- Config toggles ----------
+# Set to False once the smoke test has proven the pipeline works.
+SMOKE_TEST = True
+
+# Built-in printer used for the smoke test (exists in stock PrusaSlicer)
+SMOKE_TEST_PRINTER = "Original Prusa SL1S SPEED"
+
 # ---------- Env (no crash on import) ----------
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
@@ -23,29 +30,6 @@ def _supabase() -> Client:
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-
-# ---------- Small helpers to guess preset names ----------
-def guess_printer_preset_name(printer_id: str) -> str:
-    """
-    Map your printer_id (e.g., 'elegoo_mars3') to the likely PrusaSlicer printer preset name.
-    Tweak this mapping as needed if your AppImage shows different names under SLA printers.
-    """
-    # Basic title-casing & vendors (extend as you add printers)
-    mapping = {
-        "elegoo_mars3": "Elegoo Mars 3",
-    }
-    return mapping.get(printer_id, printer_id.replace("_", " ").title())
-
-def guess_profile_display_name(profile_id: str) -> str:
-    """
-    Map '0.05mm_standard' -> '0.05 mm Standard' (insert space before 'mm' and title-case).
-    Used for both --print-profile and --material-profile when names match.
-    """
-    s = profile_id.strip().replace("_", " ")
-    s = s.replace("mm", " mm")
-    # Fix duplicate spaces if any
-    s = " ".join(s.split())
-    return s.title()
 
 # ---------- Utilities ----------
 def sh(cmd: str, cwd: Optional[str] = None, env: Optional[dict] = None):
@@ -182,143 +166,83 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             input_model = os.path.join(wd, base_name)
             signed_download(bucket, path_in_bucket, input_model)
 
-            # 2) Profiles (robust path resolution + validation + debug)
-            printer_id_raw    = job.get("printer_id", "")
-            print_profile_raw = job.get("print_profile", "")
-
-            printer_id = printer_id_raw.strip().lower().replace(" ", "_")
-            print_profile = print_profile_raw.strip()
-
-            # Expected repo layout:
-            #   /profiles/printers/elegoo_mars3.json
-            #   /profiles/resin_presets/0.05mm_standard.ini
-            #   /profiles/uvtools_params/elegoo_mars3_std_resin.json
-            printer_json   = os.path.join("/profiles", "printers", f"{printer_id}.json")
-            ini_name       = print_profile if print_profile.endswith(".ini") else print_profile + ".ini"
-            prusa_ini      = os.path.join("/profiles", "resin_presets", ini_name)
-            uvtools_params = os.path.join("/profiles", "uvtools_params", f"{printer_id}_std_resin.json")
-
-            # Helpful debug on path issues (fail fast here, not during slicing)
-            missing = []
-            for req_path, label in [(printer_json, "printer profile"),
-                                    (prusa_ini, "resin preset"),
-                                    (uvtools_params, "uvtools params")]:
-                if not os.path.exists(req_path):
-                    missing.append(f"{label}: {req_path}")
-            if missing:
-                update_job(job_id, status="failed",
-                           error="missing_profile_assets: " + " | ".join(missing))
-                return {"ok": False, "error": "missing_profile_assets"}
-
             out_dir = os.path.join(wd, "out")
             os.makedirs(out_dir, exist_ok=True)
 
-            # 2b) Preflight: ensure PrusaSlicer binary is runnable; don't fail hard on rc alone
+            # 2) Preflight: ensure PrusaSlicer binary is runnable; don't fail hard on rc alone
             rc0, log0, cmd0 = run_prusaslicer_headless(["--version"])
             if ("PrusaSlicer" not in log0) and (rc0 != 0):
                 update_job(job_id, status="failed",
                            error=f"prusaslicer_boot_failed rc={rc0}\nCMD: {cmd0}\n{log0[-4000:]}")
                 return {"ok": False, "error": "prusaslicer_boot_failed"}
 
-            # 3) Slice with PrusaSlicer (AppImage headless) — use --datadir, and specify profiles by *name*
-            conf_dir = os.path.join(wd, "ps_config")
-            os.makedirs(conf_dir, exist_ok=True)
+            # =============================
+            # 3) SMOKE TEST (built-in printer)
+            # =============================
+            if SMOKE_TEST:
+                conf_dir = os.path.join(wd, "ps_config_smoke")
+                os.makedirs(conf_dir, exist_ok=True)
 
-            printer_name = guess_printer_preset_name(printer_id)          # e.g., "Elegoo Mars 3"
-            profile_name = guess_profile_display_name(print_profile)      # e.g., "0.05 mm Standard"
+                base_common = [
+                    "--no-gui",
+                    "--export-sla",
+                    "--datadir", conf_dir,
+                    "--loglevel", "3",
+                ]
+                smoke_args = base_common + ["--printer-profile", SMOKE_TEST_PRINTER, input_model]
 
-            # We'll try multiple variants, from strictest (with --load) to loosest (names only).
-            base_common = [
-                "--no-gui",
-                "--export-sla",
-                "--datadir", conf_dir,
-                "--loglevel", "3",
-            ]
+                rc_smoke, log_smoke, cmd_smoke = run_prusaslicer_headless(smoke_args)
+                if rc_smoke != 0:
+                    update_job(job_id, status="failed",
+                               error=f"prusaslicer_failed (builtin smoke test) rc={rc_smoke}\n"
+                                     f"CMD: {cmd_smoke}\n{log_smoke[-3000:]}")
+                    return {"ok": False, "error": "prusaslicer_failed"}
 
-        # ---------- TEMPORARY SMOKE TEST (built-in printer) ----------
-# Try a built-in Prusa SLA printer to prove the pipeline. If this succeeds,
-# your pipeline is good and the issue is just missing presets for Elegoo.
-builtin_printer = "Original Prusa SL1S SPEED"  # known built-in
-variants = [
-    base_common + ["--printer-profile", builtin_printer, input_model],
-]
-rc1, log1, cmd1 = run_prusaslicer_headless(variants[0])
-if rc1 != 0:
-    update_job(job_id, status="failed",
-               error=f"prusaslicer_failed (builtin smoke test) rc={rc1}\nCMD: {cmd1}\n{log1[-3000:]}")
-    return {"ok": False, "error": "prusaslicer_failed"}
-# ---------- END TEMPORARY SMOKE TEST ----------
+                # Locate layers from smoke test
+                slices_dir = find_layers(out_dir)
+                if not slices_dir:
+                    update_job(job_id, status="failed",
+                               error=f"no_slices_found (smoke test) in {out_dir}.\nCMD: {cmd_smoke}\n"
+                                     f"Prusa log tail:\n{log_smoke[-3000:]}")
+                    return {"ok": False, "error": "no_slices_found"}
 
+                # Zip layers for inspection
+                zip_path = os.path.join(out_dir, "layers_smoke.zip")
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+                    for fn in sorted(glob.glob(os.path.join(slices_dir, "*.png"))):
+                        z.write(fn, arcname=os.path.basename(fn))
 
-            rc1, log1, cmd1 = -1, "", ""
-            for argv in variants:
-                rc1, log1, cmd1 = run_prusaslicer_headless(argv)
-                if rc1 == 0:
-                    break
+                # Upload just the smoke test slices for now
+                job_prefix = str(job_id)
+                with open(zip_path, "rb") as f:
+                    _supabase().storage.from_("slices").upload(
+                        f"{job_prefix}/layers_smoke.zip", f,
+                        {"content-type": "application/zip", "upsert": True}
+                    )
 
-            if rc1 != 0:
-                # As a last resort, capture PrusaSlicer's own SLA help into the logs for exact guidance
-                rc_help, log_help, cmd_help = run_prusaslicer_headless(["--help-sla"])
-                update_job(job_id, status="failed",
-                           error=f"prusaslicer_failed rc={rc1}\nCMD: {cmd1}\n{log1[-3000:]}\n\n--help-sla (rc={rc_help})\n{log_help[-3000:]}")
-                return {"ok": False, "error": "prusaslicer_failed"}
+                report = {"layers": len(glob.glob(os.path.join(slices_dir, "*.png"))),
+                          "note": "Smoke test used built-in printer: " + SMOKE_TEST_PRINTER}
+                update_job(
+                    job_id,
+                    status="succeeded_smoke",
+                    report=report,
+                    output_native_path=None,
+                    output_project_path=None,
+                    output_slices_zip_path=f"slices:{job_prefix}/layers_smoke.zip",
+                    error=None,
+                )
+                return {"ok": True, "smoke_test": True}
 
-            # 3b) Find where PNG layers actually went (discover; don't assume path)
-            slices_dir = find_layers(out_dir)
-            if not slices_dir:
-                update_job(job_id, status="failed",
-                           error=f"no_slices_found in {out_dir}.\nCMD: {cmd1}\nPrusa log tail:\n{log1[-4000:]}")
-                return {"ok": False, "error": "no_slices_found"}
+            # =============================
+            # If SMOKE_TEST is False, your real slicing flow would go here:
+            #  - Load your preset bundle (printer + SLA print + material)
+            #  - Call with --printer-profile/--material-profile/--print-profile names that exist
+            #  - Then package with UVtools, upload, finalize
+            # =============================
 
-            # 4) Package with UVtools
-            with open(printer_json, "r") as f:
-                fmt = json.load(f)["format"]  # e.g., "ctb_v3"
-            native_ext = "ctb" if "ctb" in fmt else "cbddlp"
-            native_path = os.path.join(out_dir, f"print.{native_ext}")
-
-            cmd2 = (
-                f'uvtools-cli pack --format {fmt} '
-                f'--printer-profile "{printer_json}" '
-                f'--slices "{slices_dir}" '
-                f'--params "{uvtools_params}" '
-                f'--out "{native_path}"'
-            )
-            rc2, log2 = sh(cmd2)
-            if rc2 != 0:
-                update_job(job_id, status="failed", error=f"uvtools_failed rc={rc2}\n{log2[-4000:]}")
-                return {"ok": False, "error": "uvtools_failed"}
-
-            # 5) Zip layers (for download/debug)
-            zip_path = os.path.join(out_dir, "layers.zip")
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
-                for fn in sorted(glob.glob(os.path.join(slices_dir, "*.png"))):
-                    z.write(fn, arcname=os.path.basename(fn))
-
-            # 6) Upload outputs
-            job_prefix = str(job_id)
-
-            def up(bucket, path, local, ctype):
-                with open(local, "rb") as f:
-                    _supabase().storage.from_(bucket).upload(path, f, {"content-type": ctype, "upsert": True})
-
-            up("native",   f"{job_prefix}/print.{native_ext}", native_path, "application/octet-stream")
-            proj = next((f for f in os.listdir(out_dir) if f.endswith(".3mf")), None)
-            if proj:
-                up("projects", f"{job_prefix}/{proj}", os.path.join(out_dir, proj), "model/3mf")
-            up("slices",   f"{job_prefix}/layers.zip", zip_path, "application/zip")
-
-            # 7) Finalize
-            report = {"layers": len(glob.glob(os.path.join(slices_dir, "*.png")))}
-            update_job(
-                job_id,
-                status="succeeded",
-                report=report,
-                output_native_path=f"native:{job_prefix}/print.{native_ext}",
-                output_project_path=(f"projects:{job_prefix}/{proj}" if proj else None),
-                output_slices_zip_path=f"slices:{job_prefix}/layers.zip",
-                error=None,
-            )
-            return {"ok": True}
+            update_job(job_id, status="failed",
+                       error="SMOKE_TEST is disabled and no real slicing flow was provided in this build.")
+            return {"ok": False, "error": "not_implemented"}
 
         except Exception as e:
             update_job(job_id, status="failed", error=f"{type(e).__name__}: {e}")
