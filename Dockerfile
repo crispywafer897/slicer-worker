@@ -28,6 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # --------------------------------------------------------------------
 # PrusaSlicer AppImage: download and EXTRACT at build time
 # (avoids needing FUSE in Cloud Run). We symlink AppRun to PATH.
+# Pin the exact build you tested so CLI flags stay stable.
 # --------------------------------------------------------------------
 RUN wget -O /opt/PrusaSlicer.AppImage \
       https://github.com/prusa3d/PrusaSlicer/releases/download/version_2.8.1/PrusaSlicer-2.8.1+linux-x64-older-distros-GTK3-202409181354.AppImage \
@@ -39,45 +40,62 @@ RUN wget -O /opt/PrusaSlicer.AppImage \
 
 # --------------------------------------------------------------------
 # Normalize + auto-detect PrusaSlicer datadir and expose a stable path.
-# We try several common locations, then fall back to a scan.
-# We create a stable symlink at: /opt/prusaslicer/usr/share/prusa-slicer
+# We choose the *actual* resources root (prefer /opt/prusaslicer/resources),
+# verify hallmark subfolders, then create a stable alias at:
+#   /opt/prusaslicer/usr/share/prusa-slicer  →  <actual resources>
 # --------------------------------------------------------------------
 RUN set -eux; \
   ROOT="/opt/prusaslicer"; \
   mkdir -p "$ROOT/usr/share"; \
+  CANDIDATES="\
+    $ROOT/resources \
+    $ROOT/Resources \
+    $ROOT/usr/share/prusa-slicer \
+    $ROOT/usr/share/PrusaSlicer \
+    $ROOT/share/prusa-slicer \
+    $ROOT/share/PrusaSlicer \
+    $ROOT/usr/lib/PrusaSlicer/resources \
+    $ROOT/usr/lib64/PrusaSlicer/resources \
+  "; \
   DATADIR=""; \
-  # Fast path: try the usual suspects in order.
-  for d in \
-    "$ROOT/usr/share/prusa-slicer" \
-    "$ROOT/usr/share/PrusaSlicer" \
-    "$ROOT/share/prusa-slicer" \
-    "$ROOT/share/PrusaSlicer" \
-    "$ROOT/resources" \
-    "$ROOT/Resources" \
-    "$ROOT/usr/resources" \
-    "$ROOT/usr/Resources" \
-    "$ROOT/usr/lib/PrusaSlicer/resources" \
-    "$ROOT/usr/lib64/PrusaSlicer/resources" \
-  ; do \
-    if [ -d "$d" ]; then DATADIR="$d"; echo "Found candidate: $d"; break; fi; \
+  for d in $CANDIDATES; do \
+    if [ -d "$d" ]; then \
+      markers=0; \
+      [ -d "$d/profiles" ] && markers=$((markers+1)); \
+      [ -d "$d/vendor" ]   && markers=$((markers+1)); \
+      [ -d "$d/shaders" ]  && markers=$((markers+1)); \
+      if [ $markers -ge 2 ]; then \
+        DATADIR="$d"; \
+        echo "Chosen datadir (marker-validated): $d"; \
+        break; \
+      fi; \
+    fi; \
   done; \
-  # Slow path: scan a bit if nothing matched yet.
   if [ -z "$DATADIR" ]; then \
     echo "Scanning for resources under $ROOT ..."; \
-    DATADIR="$(find "$ROOT" -maxdepth 5 -type d \( -name prusa-slicer -o -name PrusaSlicer -o -name resources -o -name Resources \) | head -n1 || true)"; \
-  fi; \
+    # Find a directory named resources/Resources/prusa-slicer/PrusaSlicer that contains at least 2 markers
+    while IFS= read -r d; do \
+      markers=0; \
+      [ -d "$d/profiles" ] && markers=$((markers+1)); \
+      [ -d "$d/vendor" ]   && markers=$((markers+1)); \
+      [ -d "$d/shaders" ]  && markers=$((markers+1)); \
+      if [ $markers -ge 2 ]; then DATADIR="$d"; echo "Chosen datadir (scanned): $d"; break; fi; \
+    done <<EOF
+$(find "$ROOT" -maxdepth 5 -type d \( -name resources -o -name Resources -o -name prusa-slicer -o -name PrusaSlicer \))
+EOF \
+  ; fi; \
   if [ -z "$DATADIR" ]; then \
     echo "ERROR: Could not locate PrusaSlicer datadir under $ROOT"; \
-    find "$ROOT" -maxdepth 5 -print; \
+    find "$ROOT" -maxdepth 4 -type d -print || true; \
     exit 1; \
   fi; \
-  echo "Using datadir: $DATADIR"; \
-  # Create stable lowercase alias for runtime code and env var:
-  ln -sf "$DATADIR" "$ROOT/usr/share/prusa-slicer"; \
+  ln -sfn "$DATADIR" "$ROOT/usr/share/prusa-slicer"; \
+  echo "Stable alias → $ROOT/usr/share/prusa-slicer → $(readlink -f $ROOT/usr/share/prusa-slicer)"; \
   ls -la "$ROOT/usr/share"; \
-  test -d "$ROOT/usr/share/prusa-slicer"
+  # Light runtime check to ensure this datadir boots
+  xvfb-run -a -s '-screen 0 1024x768x24' /usr/local/bin/prusaslicer --datadir "$ROOT/usr/share/prusa-slicer" --help >/dev/null
 
-# Tell the app exactly where PrusaSlicer’s resources live (stable symlink)
+# Tell the app exactly where PrusaSlicer’s resources live (stable alias)
 ENV PRUSA_DATADIR=/opt/prusaslicer/usr/share/prusa-slicer
 
 # Build-time sanity check to fail early if the folder disappears
