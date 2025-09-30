@@ -80,7 +80,15 @@ RUN set -eux; \
     chmod +x /opt/uvtools/uvtools 2>/dev/null || true; \
     chmod +x /opt/uvtools/uvtools-cli 2>/dev/null || true; \
     # Create a wrapper that resolves to whichever binary exists
-    cat > /usr/local/bin/uvtools-cli <<'EOF'\n#!/bin/sh\nset -e\nif [ -x /opt/uvtools/uvtools-cli ]; then exec /opt/uvtools/uvtools-cli \"$@\"; fi\nif [ -x /opt/uvtools/UVtools ]; then exec /opt/uvtools/UVtools \"$@\"; fi\nif [ -x /opt/uvtools/uvtools ]; then exec /opt/uvtools/uvtools \"$@\"; fi\necho \"uvtools executable not found in /opt/uvtools\" >&2; exit 127\nEOF\n; \
+    cat > /usr/local/bin/uvtools-cli << 'EOF'
+#!/bin/sh
+set -e
+if [ -x /opt/uvtools/uvtools-cli ]; then exec /opt/uvtools/uvtools-cli "$@"; fi
+if [ -x /opt/uvtools/UVtools ];     then exec /opt/uvtools/UVtools     "$@"; fi
+if [ -x /opt/uvtools/uvtools ];     then exec /opt/uvtools/uvtools     "$@"; fi
+echo "uvtools executable not found in /opt/uvtools" >&2
+exit 127
+EOF
     chmod +x /usr/local/bin/uvtools-cli; \
     ln -sf /usr/local/bin/uvtools-cli /usr/local/bin/uvtools
 
