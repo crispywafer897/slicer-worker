@@ -18,6 +18,11 @@ ENV PS_HOME=/tmp/pshome
 ENV HOME=${PS_HOME}
 ENV XDG_CONFIG_HOME=${PS_HOME}/.config
 ENV XDG_CACHE_HOME=${PS_HOME}/.cache
+# .NET & globalization hardening for UVtools CLI
+ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
+ENV LC_ALL=C.UTF-8
+ENV LANG=C.UTF-8
+
 
 # =========================
 # System deps
@@ -34,7 +39,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgtk-3-0 libgl1 libglu1-mesa libxrender1 \
     libwebkit2gtk-4.0-37 \
     libgdiplus libunwind8 libicu70 libfontconfig1 \
+    # --- add these three ---
+    libx11-6 libx11-xcb1 libxcb1 \
   && rm -rf /var/lib/apt/lists/*
+
 
 # Make sure our writable HOME exists
 RUN mkdir -p "${XDG_CONFIG_HOME}" "${XDG_CACHE_HOME}" "${CACHE_DIR}" && chmod -R 777 "${PS_HOME}"
@@ -68,7 +76,9 @@ RUN PS_TMP=/tmp/ps_check && mkdir -p "$PS_TMP/.config" "$PS_TMP/.cache" \
 #  - Also add a compatibility symlink /usr/local/bin/uvtools → uvtools-cli
 # =========================
 ARG UVTOOLS_VERSION=v5.2.1
-ARG UVTOOLS_ZIP_URL=https://github.com/sn4k3/UVtools/releases/download/${UVTOOLS_VERSION}/UVtools_linux-x64_${UVTOOLS_VERSION}.zip
+ARG UVTOOLS_ZIP_URL=https://github.com/sn4k3/UVtools/releases/download/v5.2.1/UVtools_linux-x64_v5.2.1.zip
+
+
 
 RUN set -eux; \
     wget -O /tmp/uvtools.zip "${UVTOOLS_ZIP_URL}"; \
@@ -78,17 +88,17 @@ RUN set -eux; \
     chmod +x /opt/uvtools/UVtools 2>/dev/null || true; \
     chmod +x /opt/uvtools/uvtools 2>/dev/null || true; \
     chmod +x /opt/uvtools/uvtools-cli 2>/dev/null || true; \
-    printf '%s\n' \
-      '#!/bin/sh' \
-      'set -e' \
-      'if [ -x /opt/uvtools/uvtools-cli ]; then exec /opt/uvtools/uvtools-cli "$@"; fi' \
-      'if [ -x /opt/uvtools/UVtools ];     then exec /opt/uvtools/UVtools     "$@"; fi' \
-      'if [ -x /opt/uvtools/uvtools ];     then exec /opt/uvtools/uvtools     "$@"; fi' \
-      'echo "uvtools executable not found in /opt/uvtools" >&2' \
-      'exit 127' \
-      > /usr/local/bin/uvtools-cli; \
-    chmod +x /usr/local/bin/uvtools-cli; \
-    ln -sf /usr/local/bin/uvtools-cli /usr/local/bin/uvtools
+   
+printf '%s\n' \
+  '#!/bin/sh' \
+  'set -e' \
+  'for CAND in /opt/uvtools/uvtools-cli /opt/uvtools/UVtools /opt/uvtools/uvtools; do' \
+  '  if [ -x "$CAND" ]; then exec "$CAND" "$@"; fi' \
+  'done' \
+  'echo "uvtools executable not found in /opt/uvtools" >&2' \
+  'exit 127' \
+  > /usr/local/bin/uvtools-cli
+
 
 # =========================
 # Python deps & app
