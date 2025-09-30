@@ -38,6 +38,28 @@ RUN wget -O /opt/PrusaSlicer.AppImage \
   && ln -sf /opt/prusaslicer/AppRun /usr/local/bin/prusaslicer \
   && rm -f /opt/PrusaSlicer.AppImage
 
+# Ensure a stable, lowercase datadir path exists and verify it.
+# Some builds ship .../share/PrusaSlicer (capital P/S). If that's the case,
+# create a lowercase alias so PRUSA_DATADIR can be consistent.
+RUN set -eux; \
+    if [ -d /opt/prusaslicer/usr/share/prusa-slicer ]; then \
+      echo "Found datadir: /opt/prusaslicer/usr/share/prusa-slicer"; \
+    elif [ -d /opt/prusaslicer/usr/share/PrusaSlicer ]; then \
+      echo "Found datadir: /opt/prusaslicer/usr/share/PrusaSlicer (capitalized)"; \
+      ln -s /opt/prusaslicer/usr/share/PrusaSlicer /opt/prusaslicer/usr/share/prusa-slicer; \
+      echo "Created symlink → /opt/prusaslicer/usr/share/prusa-slicer"; \
+    else \
+      echo "ERROR: Could not locate PrusaSlicer datadir under /opt/prusaslicer/usr/share"; \
+      (ls -laR /opt/prusaslicer/usr/share || true); \
+      exit 1; \
+    fi
+
+# Tell the app exactly where PrusaSlicer’s resources live
+ENV PRUSA_DATADIR=/opt/prusaslicer/usr/share/prusa-slicer
+
+# Build-time sanity check to fail early if the folder disappears
+RUN test -d "${PRUSA_DATADIR}" || (ls -laR /opt/prusaslicer/usr/share && exit 1)
+
 # --------------------------------------------------------------------
 # UVtools CLI
 # - Using the official prebuilt zip. Symlink uvtools-cli into PATH.
