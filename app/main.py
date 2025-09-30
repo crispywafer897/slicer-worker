@@ -1,51 +1,55 @@
-import os, subprocess, shutil, json, tempfile, zipfile, urllib.request, glob, shlex, hashlib, textwrap, re, time, base64
+import os, subprocess, shutil, json, tempfile, zipfile, urllib.request, glob, shlex, hashlib, textwrap, re, time, base64, logging
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 
-from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import JSONResponse
+# --- Loud, early logging so Cloud Run logs show why start fails ---
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+log = logging.getLogger("startup")
+log.info("Starting slicer-worker app bootstrap...")
+
+# Guard every import that could crash startup
+try:
+    from fastapi import FastAPI, Header, HTTPException
+    from fastapi.responses import JSONResponse
+except Exception as e:
+    # If FastAPI cannot import, nothing else matters; raise loudly.
+    log.exception("FastAPI import failed at startup")
+    raise
 
 # Supabase import guarded so the app can start even if the lib/envs are off
 try:
     from supabase import create_client, Client  # type: ignore
     _SUPABASE_IMPORT_OK = True
+    _SUPABASE_IMPORT_ERR = ""
 except Exception as _imp_err:
     create_client = None  # type: ignore
     Client = None  # type: ignore
     _SUPABASE_IMPORT_OK = False
-    _SUPABASE_IMPORT_ERR = str(_imp_err)
+    _SUPABASE_IMPORT_ERR = f"{type(_imp_err).__name__}: {_imp_err}"
+    log.warning("Supabase import failed (service will still start): %s", _SUPABASE_IMPORT_ERR)
 
 # ---------- Env (no crash on import) ----------
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 WORKER_TOKEN = os.getenv("WORKER_TOKEN", "")
 
-# Storage bucket that holds bundles/ and uvtools_params/
 STORAGE_BUCKET = os.environ.get("STORAGE_BUCKET", "slicer-presets")
-
-# Ephemeral cache dir for downloaded bundles/params on warm instances
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", "/tmp/preset_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Where the AppImage (extracted AppRun) was installed by your Dockerfile.
 PRUSA_APPIMAGE = "/usr/local/bin/prusaslicer"
 
-# Acceptable model file extensions PrusaSlicer can ingest headlessly
 ALLOWED_MODEL_EXTS = {".stl", ".3mf", ".obj", ".amf"}
-
-# Known native resin formats PrusaSlicer/UVtools may produce
 NATIVE_EXTS = (".pwmx", ".ctb", ".ctb2", ".ctb7", ".photon", ".phz", ".cbddlp", ".sl1", ".sl1s", ".pw0", ".pws")
 
-# Allow-list of UVtools param keys that jobs may override safely
 ALLOWLIST_OVERRIDE_KEYS = {
     "layer_height_mm", "bottom_layers", "bottom_exposure_s", "normal_exposure_s",
     "light_off_delay_s", "lift_height_mm", "lift_speed_mm_s", "retract_speed_mm_s",
     "anti_aliasing"
 }
 
-# Note: We intentionally ignore legacy PRUSA_DATADIR unless explicitly opted-in via PS_FORCE_DATADIR.
 if os.environ.get("PRUSA_DATADIR") and not os.environ.get("PS_FORCE_DATADIR"):
-    print("Note: Ignoring PRUSA_DATADIR; use PS_FORCE_DATADIR to opt-in to a custom data directory.")
+    log.info("Ignoring PRUSA_DATADIR; use PS_FORCE_DATADIR to opt-in to a custom data directory.")
 
 app = FastAPI()
 
@@ -66,7 +70,7 @@ def update_job(job_id: str, **fields):
     try:
         _supabase().table("slice_jobs").update(fields).eq("id", job_id).execute()
     except Exception as e:
-        print("DB update failed:", e)
+        log.warning("DB update failed: %s", e)
 
 def signed_download(bucket: str, path: str, dest: str):
     if not SUPABASE_URL.startswith("https://"):
@@ -78,7 +82,7 @@ def signed_download(bucket: str, path: str, dest: str):
     url = signed if signed.startswith("http") else SUPABASE_URL.rstrip("/") + signed
     if not url.startswith("https://"):
         raise RuntimeError(f"Bad signed URL: {url}")
-    print(f"Downloading model from: {url}")
+    log.info("Downloading model from signed URL")
     with urllib.request.urlopen(url) as r, open(dest, "wb") as f:
         f.write(r.read())
 
@@ -171,7 +175,6 @@ def _has_uvtools() -> bool:
     from shutil import which
     if any(which(name) for name in ("uvtools-cli","uvtools","UVtools")):
         return True
-    # Also consider our wrapper path explicitly (in case PATH lookup is odd)
     return Path("/usr/local/bin/uvtools-cli").exists()
 
 def _unpack_sl1_to_pngs(native_path: str, out_dir: str) -> Optional[str]:
@@ -216,8 +219,8 @@ def run_prusaslicer_headless(args: List[str]) -> Tuple[int, str, str]:
     base = ["xvfb-run", "-a", "-s", "-screen 0 1024x768x24", PRUSA_APPIMAGE]
     cmd_list = base + args
     cmd_str = " ".join(shlex.quote(x) for x in cmd_list)
-    rc, log = sh(cmd_str, env=env)
-    return rc, log, cmd_str
+    rc, logtxt = sh(cmd_str, env=env)
+    return rc, logtxt, cmd_str
 
 # ---------- Datadir behavior (opt-in only) ----------
 def _resolve_datadir_opt_in() -> Optional[str]:
@@ -225,13 +228,13 @@ def _resolve_datadir_opt_in() -> Optional[str]:
     if forced and os.path.isdir(forced):
         return forced
     if os.environ.get("PS_FORCE_DATADIR") and not (forced and os.path.isdir(forced)):
-        print(f"PS_FORCE_DATADIR was set but not a valid directory: {os.environ.get('PS_FORCE_DATADIR')!r}")
+        log.warning("PS_FORCE_DATADIR was set but not a valid directory: %r", os.environ.get("PS_FORCE_DATADIR"))
     return None
 
 def _maybe_with_datadir(args: List[str], datadir: Optional[str]) -> List[str]:
     return (["--datadir", datadir] if datadir else []) + args
 
-# ---------- Bundle flattening (build a one-file CLI config) ----------
+# ---------- Bundle flattening ----------
 def _extract_section(text: str, kind: str, name: str) -> Dict[str, str]:
     pat = re.compile(rf"^\[{re.escape(kind)}:{re.escape(name)}\]\s*([\s\S]*?)(?=^\[|\Z)", re.M)
     m = pat.search(text)
@@ -292,15 +295,15 @@ def uvtools_synthetic_pack_test() -> Tuple[int, str]:
             "--slices", shlex.quote(str(layers)),
             "--out", shlex.quote(str(out_path))
         ])
-        rc, log = sh(cmd)
+        rc, logtxt = sh(cmd)
         if rc == 0 and out_path.exists() and out_path.stat().st_size > 0:
             return (0, f"synthetic pack OK → {out_path.name} ({out_path.stat().st_size} bytes)")
-        return (rc, f"synthetic pack failed rc={rc}\n{(log or '')[-2000:]}")
+        return (rc, f"synthetic pack failed rc={rc}\n{(logtxt or '')[-2000:]}")
 
 # ---------- Health/Readiness ----------
 @app.get("/healthz")
 def healthz():
-    return {"ok": True}
+    return {"ok": True, "msg": "slicer-worker alive"}
 
 @app.get("/ready")
 def ready():
@@ -311,9 +314,15 @@ def ready():
         "has_SERVICE_ROLE": bool(SUPABASE_SERVICE_ROLE_KEY),
         "has_WORKER_TOKEN": bool(WORKER_TOKEN),
         "supabase_import_ok": _SUPABASE_IMPORT_OK,
+        "supabase_import_err": _SUPABASE_IMPORT_ERR if not _SUPABASE_IMPORT_OK else "",
         "storage_bucket": STORAGE_BUCKET,
         "datadir": forced or "(none; using default user config under $HOME)",
     }
+
+@app.get("/")
+def root():
+    # Cloud Run sometimes probes root; keep it simple.
+    return {"ok": True, "service": "slicer-worker"}
 
 @app.get("/diag/uvtools")
 def diag_uvtools():
@@ -324,8 +333,9 @@ def diag_uvtools():
         "version_rc": rc_v,
         "version": (log_v or "").strip().splitlines()[:2],
         "synthetic_pack_rc": rc_p,
-        "synthetic_pack_result": log_p[-1200:],
+        "synthetic_pack_result": (log_p or "")[-1200:],
     }
+
 
 # ---------- UVtools params validation ----------
 def _validate_uvtools_params(params: Dict[str, Any], target_format: str) -> Optional[str]:
@@ -337,8 +347,6 @@ def _validate_uvtools_params(params: Dict[str, Any], target_format: str) -> Opti
     if target_format in ("ctb","ctb7","ctb2"):
         needed = [
             "display_pixels_x", "display_pixels_y",
-            # allow either pixel_size_um or per-axis fields
-            # (we only *require* one; UVtools accepts both styles)
             "bottom_layers", "bottom_exposure_s", "normal_exposure_s",
             "lift_height_mm", "lift_speed_mm_s", "retract_speed_mm_s"
         ]
@@ -380,14 +388,12 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
 
         wd = tempfile.mkdtemp(prefix=f"job_{job_id}_")
         try:
-            # Datadir (optional)
             datadir = _resolve_datadir_opt_in()
             if os.environ.get("PS_FORCE_DATADIR") and not datadir:
                 update_job(job_id, status="failed",
                            error=f"ps_force_datadir_invalid: PS_FORCE_DATADIR={os.environ.get('PS_FORCE_DATADIR')!r} is not a directory")
                 return {"ok": False, "error": "ps_force_datadir_invalid"}
 
-            # Input model
             in_spec = job["input_path"]
             if ":" not in in_spec:
                 update_job(job_id, status="failed", error=f"bad_input_path_format (expected 'bucket:path'): {in_spec}")
@@ -404,7 +410,6 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             input_model = os.path.join(wd, base_name)
             signed_download(bucket, path_in_bucket, input_model)
 
-            # Presets
             printer_id_raw = job.get("printer_id", "")
             if not printer_id_raw:
                 update_job(job_id, status="failed", error="missing printer_id")
@@ -421,8 +426,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             bundle_local = preset["bundle_local"]
             params_local = preset["params_local"]
 
-            # Preflight: confirm PS is runnable
-            rc0, log0, cmd0 = run_prusaslicer_headless(_maybe_with_datadir(["--help"], _resolve_datadir_opt_in()))
+            rc0, log0, cmd0 = run_prusaslicer_headless(_maybe_with_datadir(["--help"], datadir))
             if ("PrusaSlicer" not in (log0 or "")) and (rc0 != 0):
                 update_job(job_id, status="failed", error=f"prusaslicer_boot_failed rc={rc0}\nCMD: {cmd0}\n{(log0 or '')[-4000:]}")
                 return {"ok": False, "error": "prusaslicer_boot_failed"}
@@ -430,7 +434,6 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             out_dir = os.path.join(wd, "out")
             os.makedirs(out_dir, exist_ok=True)
 
-            # Flatten profiles into a one-file CLI config
             printer_name     = row["printer_profile_name"]
             print_profile    = job.get("print_profile")    or row["print_profile_name"]
             material_profile = job.get("material_profile") or row["material_profile_name"]
@@ -441,18 +444,17 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 update_job(job_id, status="failed", error=f"bundle_section_missing: {he.detail}")
                 return {"ok": False, "error": "bundle_section_missing"}
 
-            # Slice attempts
             attempts: List[List[str]] = []
-            attempts.append(_maybe_with_datadir(["--export-sla","--loglevel","3","--output",out_dir,"--load",str(merged_cli_ini),input_model], _resolve_datadir_opt_in()))
-            attempts.append(_maybe_with_datadir(["--slice","--loglevel","3","--output",out_dir,"--load",str(merged_cli_ini),input_model], _resolve_datadir_opt_in()))
+            attempts.append(_maybe_with_datadir(["--export-sla","--loglevel","3","--output",out_dir,"--load",str(merged_cli_ini),input_model], datadir))
+            attempts.append(_maybe_with_datadir(["--slice","--loglevel","3","--output",out_dir,"--load",str(merged_cli_ini),input_model], datadir))
             project_out = os.path.join(out_dir, "project.3mf")
-            attempts.append(_maybe_with_datadir(["--export-3mf","--loglevel","3","--output",project_out,"--load",str(merged_cli_ini),input_model], _resolve_datadir_opt_in()))
+            attempts.append(_maybe_with_datadir(["--export-3mf","--loglevel","3","--output",project_out,"--load",str(merged_cli_ini),input_model], datadir))
 
             success = False
             attempt_logs: List[str] = []
             full_logs: List[str] = []
 
-            v_rc, v_log, v_cmd = run_prusaslicer_headless(_maybe_with_datadir(["--help"], _resolve_datadir_opt_in()))
+            v_rc, v_log, v_cmd = run_prusaslicer_headless(_maybe_with_datadir(["--help"], datadir))
             ps_version = (v_log or "").strip().splitlines()[:3]
 
             cmd1, log1 = "", ""
@@ -471,7 +473,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
 
             if not success:
                 presets_available = list_bundle_presets(bundle_local)
-                rc_help, log_help, cmd_help = run_prusaslicer_headless(_maybe_with_datadir(["--help-sla"], _resolve_datadir_opt_in()))
+                rc_help, log_help, cmd_help = run_prusaslicer_headless(_maybe_with_datadir(["--help-sla"], datadir))
                 update_job(
                     job_id,
                     status="failed",
@@ -479,7 +481,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
 ps_version: {ps_version}
 printer_id: {printer_id}
 bundle: {row['bundle_path']}  params: {row['uvtools_params_path']}
-chosen_datadir: {_resolve_datadir_opt_in() or "(none; default user config under $HOME)"}
+chosen_datadir: {datadir or "(none; default user config under $HOME)"}
 
 presets_requested:
   printer={printer_name}
@@ -549,7 +551,7 @@ presets_available:
                     if rc_u == 0:
                         slices_dir = find_layers(unpack_dir)
                     else:
-                        print(f"uvtools unpack failed rc={rc_u}; will try ZIP fallback for .sl1/.sl1s")
+                        log.warning("uvtools unpack failed rc=%s; will try ZIP fallback for .sl1/.sl1s", rc_u)
 
                 if not slices_dir and found_ext in ("sl1", "sl1s"):
                     slices_dir = _unpack_sl1_to_pngs(native_found, unpack_dir)
@@ -564,7 +566,6 @@ presets_available:
                 merged_params_path = merge_overrides(Path(params_local), job.get("overrides"))
                 params_obj = _read_json(Path(merged_params_path))
                 target_format = str(params_obj.get("target_format") or row.get("native_format") or "").lower().strip()
-                # Allow aliasing ctb→ctb7 etc.
                 fmt_alias = {"ctb": params_obj.get("ctb_variant", "ctb")}
                 target_format = fmt_alias.get(target_format, target_format)
                 if not target_format:
@@ -578,13 +579,11 @@ presets_available:
                 native_ext = target_format
                 native_path = os.path.join(out_dir, f"print.{native_ext}")
 
-                # Validate params prior to invoking UVtools
                 params_err = _validate_uvtools_params(params_obj, target_format)
                 if params_err:
                     update_job(job_id, status="failed", error=f"uvtools_params_invalid: {params_err}")
                     return {"ok": False, "error": "uvtools_params_invalid"}
 
-                # Pack via UVtools
                 if _has_uvtools():
                     cmd2_list = [
                         "uvtools-cli","pack",
@@ -713,4 +712,6 @@ presets_available:
             shutil.rmtree(wd, ignore_errors=True)
 
     except Exception as e:
+        # Absolutely never crash the process; surface the error in JSON
+        log.exception("Fatal handler failure at /jobs")
         return JSONResponse({"ok": False, "error": f"fatal: {e}"}, status_code=200)
