@@ -1,10 +1,19 @@
-import os, subprocess, shutil, json, tempfile, zipfile, urllib.request, glob, shlex, hashlib, textwrap, re, time
+import os, subprocess, shutil, json, tempfile, zipfile, urllib.request, glob, shlex, hashlib, textwrap, re, time, base64
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
-from supabase import create_client, Client
+
+# Supabase import guarded so the app can start even if the lib/envs are off
+try:
+    from supabase import create_client, Client  # type: ignore
+    _SUPABASE_IMPORT_OK = True
+except Exception as _imp_err:
+    create_client = None  # type: ignore
+    Client = None  # type: ignore
+    _SUPABASE_IMPORT_OK = False
+    _SUPABASE_IMPORT_ERR = str(_imp_err)
 
 # ---------- Env (no crash on import) ----------
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
@@ -19,7 +28,6 @@ CACHE_DIR = Path(os.environ.get("CACHE_DIR", "/tmp/preset_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Where the AppImage (extracted AppRun) was installed by your Dockerfile.
-# Dockerfile symlinks /opt/prusaslicer/AppRun -> /usr/local/bin/prusaslicer
 PRUSA_APPIMAGE = "/usr/local/bin/prusaslicer"
 
 # Acceptable model file extensions PrusaSlicer can ingest headlessly
@@ -42,7 +50,9 @@ if os.environ.get("PRUSA_DATADIR") and not os.environ.get("PS_FORCE_DATADIR"):
 app = FastAPI()
 
 # Lazily create Supabase client (so missing envs don't crash import)
-def _supabase() -> Client:
+def _supabase():
+    if not _SUPABASE_IMPORT_OK:
+        raise RuntimeError(f"supabase lib import failed: {_SUPABASE_IMPORT_ERR}")
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
@@ -73,9 +83,6 @@ def signed_download(bucket: str, path: str, dest: str):
         f.write(r.read())
 
 def upload_file(bucket: str, path: str, local_path: str, content_type: str, upsert: bool = True):
-    """
-    Upload to Supabase Storage using bytes and string options to avoid bool->encode errors.
-    """
     data = Path(local_path).read_bytes()
     file_options = {
         "contentType": content_type,
@@ -85,7 +92,6 @@ def upload_file(bucket: str, path: str, local_path: str, content_type: str, upse
     _supabase().storage.from_(bucket).upload(path, data, file_options)
 
 def find_layers(base_dir: str) -> Optional[str]:
-    # common PrusaSlicer SLA outputs
     for candidate in (os.path.join(base_dir, "slices"), os.path.join(base_dir, "sla")):
         if os.path.isdir(candidate) and glob.glob(os.path.join(candidate, "*.png")):
             return candidate
@@ -97,11 +103,6 @@ def find_layers(base_dir: str) -> Optional[str]:
     return best_dir if best_count > 0 else None
 
 def find_native_artifact(base_dir: str) -> Optional[str]:
-    """
-    If PrusaSlicer exported a native resin file directly (e.g., .sl1 on SL1/SL1S),
-    return the newest such file path; else None.
-    (Note: PrusaSlicer does not emit .ctb; those are UVtools-packed.)
-    """
     candidates: List[str] = []
     for root, _, files in os.walk(base_dir):
         for fn in files:
@@ -122,7 +123,7 @@ def _sha256(path: Path) -> str:
 def _download_storage(object_path: str, dest: Path):
     dest.parent.mkdir(parents=True, exist_ok=True)
     data = _supabase().storage.from_(STORAGE_BUCKET).download(object_path)
-    dest.write_bytes(data)  # supabase-py returns bytes
+    dest.write_bytes(data)
 
 def resolve_preset(printer_id: str) -> Dict[str, Any]:
     res = _supabase().table("printer_presets").select("*").eq("id", printer_id).single().execute()
@@ -168,14 +169,12 @@ def _read_json(path: Path) -> Dict[str, Any]:
 
 def _has_uvtools() -> bool:
     from shutil import which
-    return any(which(name) for name in ("uvtools-cli","uvtools","UVtools"))
-
+    if any(which(name) for name in ("uvtools-cli","uvtools","UVtools")):
+        return True
+    # Also consider our wrapper path explicitly (in case PATH lookup is odd)
+    return Path("/usr/local/bin/uvtools-cli").exists()
 
 def _unpack_sl1_to_pngs(native_path: str, out_dir: str) -> Optional[str]:
-    """
-    Minimal fallback: .sl1/.sl1s are ZIP archives. Extract PNGs if UVtools is not present or failed.
-    Returns the directory containing PNGs, or None if none found.
-    """
     try:
         with zipfile.ZipFile(native_path, 'r') as z:
             z.extractall(out_dir)
@@ -255,7 +254,6 @@ def materialize_cli_config(bundle_path: str, printer_name: str, print_name: str,
     for kind, name in (("printer", printer_name), ("sla_print", print_name), ("sla_material", material_name)):
         section = _extract_section(txt, kind, name)
         if not section:
-            # fixed the stray '}' here
             raise HTTPException(status_code=400, detail=f"Missing section [{kind}:{name}] in bundle")
         merged.update(section)
     merged.setdefault("printer_technology", "SLA")
@@ -265,17 +263,13 @@ def materialize_cli_config(bundle_path: str, printer_name: str, print_name: str,
             f.write(f"{k} = {v}\n")
     return out
 
-
 # ---------- UVtools diagnostics ----------
-
 def uvtools_version() -> Tuple[int, str]:
     if not _has_uvtools():
         return (127, "uvtools-cli not found on PATH")
     return sh("uvtools-cli --version")
 
 def _write_min_png(dir_path: str, name: str):
-    # 1x1 transparent PNG (base64) to avoid external deps
-    import base64
     png_b64 = (
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGMAAQAABQAB"
         "J7nZVQAAAABJRU5ErkJggg=="
@@ -284,20 +278,14 @@ def _write_min_png(dir_path: str, name: str):
     p.write_bytes(base64.b64decode(png_b64))
 
 def uvtools_synthetic_pack_test() -> Tuple[int, str]:
-    """
-    Creates 2 tiny PNG 'layers' and tries to pack them to a disposable SL1.
-    This avoids any custom params to test raw CLI viability.
-    """
     if not _has_uvtools():
         return (127, "uvtools-cli not found on PATH")
-
     with tempfile.TemporaryDirectory() as td:
         layers = Path(td) / "layers"
         layers.mkdir(parents=True, exist_ok=True)
         _write_min_png(layers, "0001")
         _write_min_png(layers, "0002")
         out_path = Path(td) / "synthetic.sl1"
-        # Minimal format uses defaults; SL1 is the least demanding for a smoke test
         cmd = " ".join([
             "uvtools-cli","pack",
             "--format","sl1",
@@ -309,8 +297,6 @@ def uvtools_synthetic_pack_test() -> Tuple[int, str]:
             return (0, f"synthetic pack OK → {out_path.name} ({out_path.stat().st_size} bytes)")
         return (rc, f"synthetic pack failed rc={rc}\n{(log or '')[-2000:]}")
 
-
-
 # ---------- Health/Readiness ----------
 @app.get("/healthz")
 def healthz():
@@ -320,14 +306,16 @@ def healthz():
 def ready():
     forced = _resolve_datadir_opt_in()
     return {
-        "ok": bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and WORKER_TOKEN),
+        "ok": bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and WORKER_TOKEN and _SUPABASE_IMPORT_OK),
         "has_SUPABASE_URL": bool(SUPABASE_URL),
         "has_SERVICE_ROLE": bool(SUPABASE_SERVICE_ROLE_KEY),
         "has_WORKER_TOKEN": bool(WORKER_TOKEN),
+        "supabase_import_ok": _SUPABASE_IMPORT_OK,
         "storage_bucket": STORAGE_BUCKET,
         "datadir": forced or "(none; using default user config under $HOME)",
     }
-    @app.get("/diag/uvtools")
+
+@app.get("/diag/uvtools")
 def diag_uvtools():
     rc_v, log_v = uvtools_version()
     rc_p, log_p = uvtools_synthetic_pack_test()
@@ -339,6 +327,33 @@ def diag_uvtools():
         "synthetic_pack_result": log_p[-1200:],
     }
 
+# ---------- UVtools params validation ----------
+def _validate_uvtools_params(params: Dict[str, Any], target_format: str) -> Optional[str]:
+    must_have_common = ["layer_height_mm"]
+    for k in must_have_common:
+        if k not in params:
+            return f"params missing required key: {k}"
+
+    if target_format in ("ctb","ctb7","ctb2"):
+        needed = [
+            "display_pixels_x", "display_pixels_y",
+            # allow either pixel_size_um or per-axis fields
+            # (we only *require* one; UVtools accepts both styles)
+            "bottom_layers", "bottom_exposure_s", "normal_exposure_s",
+            "lift_height_mm", "lift_speed_mm_s", "retract_speed_mm_s"
+        ]
+        if not any(k in params for k in ("pixel_size_um","pixel_size_x_um")):
+            return "params missing pixel size (pixel_size_um or pixel_size_x_um)"
+        for k in needed:
+            if k not in params:
+                return f"params missing required key for {target_format}: {k}"
+
+    if target_format in ("sl1","sl1s"):
+        for k in ("bottom_exposure_s","normal_exposure_s"):
+            if k not in params:
+                return f"params missing required key for {target_format}: {k}"
+
+    return None
 
 # ---------- Main job endpoint ----------
 @app.post("/jobs")
@@ -406,8 +421,8 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             bundle_local = preset["bundle_local"]
             params_local = preset["params_local"]
 
-            # Preflight
-            rc0, log0, cmd0 = run_prusaslicer_headless(_maybe_with_datadir(["--help"], datadir))
+            # Preflight: confirm PS is runnable
+            rc0, log0, cmd0 = run_prusaslicer_headless(_maybe_with_datadir(["--help"], _resolve_datadir_opt_in()))
             if ("PrusaSlicer" not in (log0 or "")) and (rc0 != 0):
                 update_job(job_id, status="failed", error=f"prusaslicer_boot_failed rc={rc0}\nCMD: {cmd0}\n{(log0 or '')[-4000:]}")
                 return {"ok": False, "error": "prusaslicer_boot_failed"}
@@ -428,16 +443,16 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
 
             # Slice attempts
             attempts: List[List[str]] = []
-            attempts.append(_maybe_with_datadir(["--export-sla","--loglevel","3","--output",out_dir,"--load",str(merged_cli_ini),input_model], datadir))
-            attempts.append(_maybe_with_datadir(["--slice","--loglevel","3","--output",out_dir,"--load",str(merged_cli_ini),input_model], datadir))
+            attempts.append(_maybe_with_datadir(["--export-sla","--loglevel","3","--output",out_dir,"--load",str(merged_cli_ini),input_model], _resolve_datadir_opt_in()))
+            attempts.append(_maybe_with_datadir(["--slice","--loglevel","3","--output",out_dir,"--load",str(merged_cli_ini),input_model], _resolve_datadir_opt_in()))
             project_out = os.path.join(out_dir, "project.3mf")
-            attempts.append(_maybe_with_datadir(["--export-3mf","--loglevel","3","--output",project_out,"--load",str(merged_cli_ini),input_model], datadir))
+            attempts.append(_maybe_with_datadir(["--export-3mf","--loglevel","3","--output",project_out,"--load",str(merged_cli_ini),input_model], _resolve_datadir_opt_in()))
 
             success = False
             attempt_logs: List[str] = []
             full_logs: List[str] = []
 
-            v_rc, v_log, v_cmd = run_prusaslicer_headless(_maybe_with_datadir(["--help"], datadir))
+            v_rc, v_log, v_cmd = run_prusaslicer_headless(_maybe_with_datadir(["--help"], _resolve_datadir_opt_in()))
             ps_version = (v_log or "").strip().splitlines()[:3]
 
             cmd1, log1 = "", ""
@@ -456,7 +471,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
 
             if not success:
                 presets_available = list_bundle_presets(bundle_local)
-                rc_help, log_help, cmd_help = run_prusaslicer_headless(_maybe_with_datadir(["--help-sla"], datadir))
+                rc_help, log_help, cmd_help = run_prusaslicer_headless(_maybe_with_datadir(["--help-sla"], _resolve_datadir_opt_in()))
                 update_job(
                     job_id,
                     status="failed",
@@ -464,7 +479,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
 ps_version: {ps_version}
 printer_id: {printer_id}
 bundle: {row['bundle_path']}  params: {row['uvtools_params_path']}
-chosen_datadir: {datadir or "(none; default user config under $HOME)"}
+chosen_datadir: {_resolve_datadir_opt_in() or "(none; default user config under $HOME)"}
 
 presets_requested:
   printer={printer_name}
@@ -496,7 +511,6 @@ presets_available:
                 expected_native = str(row.get("native_format", "")).lower()
 
                 if found_ext == expected_native and found_ext:
-                    # Accept direct native
                     slices_dir_opt = find_layers(out_dir)
                     zip_path = None
                     if slices_dir_opt:
@@ -507,7 +521,6 @@ presets_available:
 
                     native_ext = found_ext
                     job_prefix = str(job_id)
-                    print(f"Uploading native artifact: bucket=native path={job_prefix}/print.{native_ext}")
                     upload_file("native", f"{job_prefix}/print.{native_ext}", native_found, "application/octet-stream")
                     proj = next((f for f in os.listdir(out_dir) if f.endswith(".3mf")), None)
                     if proj:
@@ -524,8 +537,7 @@ presets_available:
                                error=None)
                     return {"ok": True}
 
-                # Wrong native (e.g., .sl1) → try to unpack → pack to target format
-                print(f"Found PS-native ext=.{found_ext} but expected .{expected_native}. Attempting unpack.")
+                # Wrong native → unpack → pack
                 unpack_dir = os.path.join(out_dir, "unpacked_slices")
                 os.makedirs(unpack_dir, exist_ok=True)
 
@@ -549,26 +561,21 @@ presets_available:
                     update_job(job_id, status="failed", error=detail)
                     return {"ok": False, "error": "no_slices_found_after_unpack"}
 
-                # Merge overrides & target format
                 merged_params_path = merge_overrides(Path(params_local), job.get("overrides"))
                 params_obj = _read_json(Path(merged_params_path))
                 target_format = str(params_obj.get("target_format") or row.get("native_format") or "").lower().strip()
-                # Map generic CTB to an explicit variant if provided
-fmt_alias = {
-    "ctb": params_obj.get("ctb_variant", "ctb"),  # e.g., "ctb7"
-}
-target_format = fmt_alias.get(target_format, target_format)
-
+                # Allow aliasing ctb→ctb7 etc.
+                fmt_alias = {"ctb": params_obj.get("ctb_variant", "ctb")}
+                target_format = fmt_alias.get(target_format, target_format)
                 if not target_format:
                     update_job(job_id, status="failed", error="uvtools_target_format_missing (no 'target_format' in params and no 'native_format' in preset)")
                     return {"ok": False, "error": "uvtools_target_format_missing"}
 
                 if not _has_uvtools() and target_format not in ("sl1", "sl1s"):
-                    update_job(job_id, status="failed",
-                               error="uvtools_missing: packing to non-SL1 format (e.g., CTB) requires uvtools-cli in the container.")
+                    update_job(job_id, status="failed", error="uvtools_missing: packing to non-SL1 format (e.g., CTB) requires uvtools-cli in the container.")
                     return {"ok": False, "error": "uvtools_missing"}
 
-                               native_ext = target_format
+                native_ext = target_format
                 native_path = os.path.join(out_dir, f"print.{native_ext}")
 
                 # Validate params prior to invoking UVtools
@@ -586,33 +593,28 @@ target_format = fmt_alias.get(target_format, target_format)
                         "--slices", slices_dir,
                         "--out",    native_path
                     ]
-                    # Optional: give more CLI verbosity when debugging opaque exits
-                    # cmd2_list.insert(1, "--loglevel"); cmd2_list.insert(2, "debug")
                     cmd2 = " ".join(shlex.quote(str(x)) for x in cmd2_list)
                     rc2, log2 = sh(cmd2)
                 else:
                     rc2, log2 = (127, "uvtools-cli not found")
 
+                if rc2 != 0:
+                    crash_dir = os.path.join(out_dir, "uvtools_crash")
+                    os.makedirs(crash_dir, exist_ok=True)
+                    log_file = os.path.join(crash_dir, "uvtools_pack.log.txt")
+                    Path(log_file).write_text(log2 or "", errors="ignore")
+                    storage_log_path = f"{job_id}/uvtools_pack_{int(time.time())}.log.txt"
+                    try:
+                        upload_file("slices", storage_log_path, log_file, "text/plain")
+                    except Exception:
+                        storage_log_path = None
 
-                           if rc2 != 0:
-                # Persist full logs to Storage for analysis
-                crash_dir = os.path.join(out_dir, "uvtools_crash")
-                os.makedirs(crash_dir, exist_ok=True)
-                log_file = os.path.join(crash_dir, "uvtools_pack.log.txt")
-                Path(log_file).write_text(log2 or "", errors="ignore")
-                storage_log_path = f"{job_id}/uvtools_pack_{int(time.time())}.log.txt"
-                try:
-                    upload_file("slices", storage_log_path, log_file, "text/plain")
-                except Exception as _e:
-                    storage_log_path = None
-
-                update_job(
-                    job_id,
-                    status="failed",
-                    error=f"uvtools_failed rc={rc2}\nlog_tail:\n{(log2 or '')[-4000:]}\nlog_path:{storage_log_path or '(upload_failed)'}"
-                )
-                return {"ok": False, "error": "uvtools_failed"}
-
+                    update_job(
+                        job_id,
+                        status="failed",
+                        error=f"uvtools_failed rc={rc2}\nlog_tail:\n{(log2 or '')[-4000:]}\nlog_path:{storage_log_path or '(upload_failed)'}"
+                    )
+                    return {"ok": False, "error": "uvtools_failed"}
 
                 zip_path = os.path.join(out_dir, "layers.zip")
                 with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
@@ -620,7 +622,6 @@ target_format = fmt_alias.get(target_format, target_format)
                         z.write(fn, arcname=os.path.basename(fn))
 
                 job_prefix = str(job_id)
-                print(f"Uploading UVtools native artifact: bucket=native path={job_prefix}/print.{native_ext}")
                 upload_file("native", f"{job_prefix}/print.{native_ext}", native_path, "application/octet-stream")
                 proj = next((f for f in os.listdir(out_dir) if f.endswith(".3mf")), None)
                 if proj:
@@ -636,43 +637,7 @@ target_format = fmt_alias.get(target_format, target_format)
                            error=None)
                 return {"ok": True}
 
-# ---------- UVtools params validation ----------
-
-def _validate_uvtools_params(params: Dict[str, Any], target_format: str) -> Optional[str]:
-    """
-    Return an error string if invalid, otherwise None.
-    Minimal but pragmatic checks for CTB-family and SL1.
-    """
-    must_have_common = ["layer_height_mm"]
-    for k in must_have_common:
-        if k not in params:
-            return f"params missing required key: {k}"
-
-    if target_format in ("ctb","ctb7","ctb2"):
-        needed = [
-            # resolution & pixel geometry
-            "display_pixels_x", "display_pixels_y",
-            "pixel_size_um",   # or "pixel_size_x_um"/"pixel_size_y_um"
-            # motion/exposure basics (names you used in overrides are fine)
-            "bottom_layers", "bottom_exposure_s", "normal_exposure_s",
-            "lift_height_mm", "lift_speed_mm_s", "retract_speed_mm_s"
-        ]
-        if not any(k in params for k in ("pixel_size_um","pixel_size_x_um")):
-            return "params missing pixel size (pixel_size_um or pixel_size_x_um)"
-        for k in needed:
-            if k not in params and k != "pixel_size_um":  # handled above
-                return f"params missing required key for {target_format}: {k}"
-
-    # SL1/SL1S are more forgiving, but check basic exposure too
-    if target_format in ("sl1","sl1s"):
-        for k in ("bottom_exposure_s","normal_exposure_s"):
-            if k not in params:
-                return f"params missing required key for {target_format}: {k}"
-
-    return None
-
-            
-            # --- Standard: look for PNGs directly (when PS exported them) ---
+            # --- Standard: look for PNGs directly ---
             slices_dir = find_layers(out_dir)
             if not slices_dir:
                 update_job(job_id, status="failed", error=f"no_slices_found in {out_dir}.\nCMD: {cmd1}\nPrusa log tail:\n{(log1 or '')[-4000:]}")
@@ -681,49 +646,32 @@ def _validate_uvtools_params(params: Dict[str, Any], target_format: str) -> Opti
             merged_params_path = merge_overrides(Path(params_local), job.get("overrides"))
             params_obj = _read_json(Path(merged_params_path))
             target_format = str(params_obj.get("target_format") or row.get("native_format") or "").lower().strip()
-# Map generic CTB to an explicit variant if provided
-fmt_alias = {
-    "ctb": params_obj.get("ctb_variant", "ctb"),  # e.g., "ctb7"
-}
-target_format = fmt_alias.get(target_format, target_format)
-
+            fmt_alias = {"ctb": params_obj.get("ctb_variant", "ctb")}
+            target_format = fmt_alias.get(target_format, target_format)
             if not target_format:
                 update_job(job_id, status="failed", error="uvtools_target_format_missing (no 'target_format' in params and no 'native_format' in preset)")
                 return {"ok": False, "error": "uvtools_target_format_missing"}
 
             if not _has_uvtools() and target_format not in ("sl1", "sl1s"):
-                update_job(job_id, status="failed",
-                           error="uvtools_missing: packing to non-SL1 format (e.g., CTB) requires uvtools-cli in the container.")
+                update_job(job_id, status="failed", error="uvtools_missing: packing to non-SL1 format (e.g., CTB) requires uvtools-cli in the container.")
                 return {"ok": False, "error": "uvtools_missing"}
 
-                          native_ext = target_format
-                native_path = os.path.join(out_dir, f"print.{native_ext}")
+            native_ext = target_format
+            native_path = os.path.join(out_dir, f"print.{native_ext}")
 
-                # Validate params prior to invoking UVtools
-                params_err = _validate_uvtools_params(params_obj, target_format)
-                if params_err:
-                    update_job(job_id, status="failed", error=f"uvtools_params_invalid: {params_err}")
-                    return {"ok": False, "error": "uvtools_params_invalid"}
+            params_err = _validate_uvtools_params(params_obj, target_format)
+            if params_err:
+                update_job(job_id, status="failed", error=f"uvtools_params_invalid: {params_err}")
+                return {"ok": False, "error": "uvtools_params_invalid"}
 
-                # Pack via UVtools
-                if _has_uvtools():
-                    cmd2_list = [
-                        "uvtools-cli","pack",
-                        "--format", target_format,
-                        "--params", str(merged_params_path),
-                        "--slices", slices_dir,
-                        "--out",    native_path
-                    ]
-                    # Optional: give more CLI verbosity when debugging opaque exits
-                    # cmd2_list.insert(1, "--loglevel"); cmd2_list.insert(2, "debug")
-                    cmd2 = " ".join(shlex.quote(str(x)) for x in cmd2_list)
-                    rc2, log2 = sh(cmd2)
-                else:
-                    rc2, log2 = (127, "uvtools-cli not found")
+            if _has_uvtools():
+                cmd2_list = ["uvtools-cli","pack","--format",target_format,"--params",str(merged_params_path),"--slices",slices_dir,"--out",native_path]
+                cmd2 = " ".join(shlex.quote(str(x)) for x in cmd2_list)
+                rc2, log2 = sh(cmd2)
+            else:
+                rc2, log2 = (127, "uvtools-cli not found")
 
-
-                        if rc2 != 0:
-                # Persist full logs to Storage for analysis
+            if rc2 != 0:
                 crash_dir = os.path.join(out_dir, "uvtools_crash")
                 os.makedirs(crash_dir, exist_ok=True)
                 log_file = os.path.join(crash_dir, "uvtools_pack.log.txt")
@@ -731,16 +679,11 @@ target_format = fmt_alias.get(target_format, target_format)
                 storage_log_path = f"{job_id}/uvtools_pack_{int(time.time())}.log.txt"
                 try:
                     upload_file("slices", storage_log_path, log_file, "text/plain")
-                except Exception as _e:
+                except Exception:
                     storage_log_path = None
 
-                update_job(
-                    job_id,
-                    status="failed",
-                    error=f"uvtools_failed rc={rc2}\nlog_tail:\n{(log2 or '')[-4000:]}\nlog_path:{storage_log_path or '(upload_failed)'}"
-                )
+                update_job(job_id, status="failed", error=f"uvtools_failed rc={rc2}\nlog_tail:\n{(log2 or '')[-4000:]}\nlog_path:{storage_log_path or '(upload_failed)'}")
                 return {"ok": False, "error": "uvtools_failed"}
-
 
             zip_path = os.path.join(out_dir, "layers.zip")
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
@@ -748,7 +691,6 @@ target_format = fmt_alias.get(target_format, target_format)
                     z.write(fn, arcname=os.path.basename(fn))
 
             job_prefix = str(job_id)
-            print(f"Uploading UVtools native artifact: bucket=native path={job_prefix}/print.{native_ext}")
             upload_file("native", f"{job_prefix}/print.{native_ext}", native_path, "application/octet-stream")
             proj = next((f for f in os.listdir(out_dir) if f.endswith(".3mf")), None)
             if proj:
