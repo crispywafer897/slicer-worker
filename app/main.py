@@ -132,13 +132,38 @@ def merge_overrides(params_path: Path, overrides: Optional[Dict[str, Any]]) -> P
     merged_path.write_text(json.dumps(params))
     return merged_path
 
+# ---------- User-config seeding for headless ----------
+def _config_root_from_env(env: dict) -> Path:
+    # PrusaSlicer uses XDG_CONFIG_HOME/PrusaSlicer by default on Linux
+    xdg = env.get("XDG_CONFIG_HOME") or os.path.join(env.get("HOME", "/tmp/ps_home"), ".config")
+    return Path(xdg) / "PrusaSlicer"
+
+def _ensure_minimal_user_config(env: dict) -> Path:
+    """
+    Create a minimal user config tree so PrusaSlicer does not abort on "Configuration wasn't found".
+    We do NOT run the wizard; we just create expected skeleton files/dirs.
+    """
+    root = _config_root_from_env(env)
+    root.mkdir(parents=True, exist_ok=True)
+    # Basic subfolders typically present in user config
+    for sub in ("printer", "print", "filament", "snapshots"):
+        (root / sub).mkdir(exist_ok=True)
+    ini = root / "PrusaSlicer.ini"
+    if not ini.exists():
+        ini.write_text(
+            "[preferences]\n"
+            "version = 2.8.1\n"
+            "mode = Expert\n"
+        )
+    return root
+
 # ---------- PrusaSlicer runner & env ----------
 def _base_env() -> dict:
     env = os.environ.copy()
     env.setdefault("NO_AT_BRIDGE", "1")
     env.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
     env.setdefault("GDK_BACKEND", "x11")
-    ps_home = env.get("PS_HOME", "/tmp/ps_home")
+    ps_home = env.get("PS_HOME", "/tmp/ps_home")  # Dockerfile sets PS_HOME=/tmp/pshome; we'll honor it if present
     os.makedirs(ps_home, exist_ok=True)
     env.setdefault("HOME", ps_home)
     env.setdefault("XDG_CONFIG_HOME", os.path.join(ps_home, ".config"))
@@ -147,6 +172,8 @@ def _base_env() -> dict:
 
 def run_prusaslicer_headless(args: List[str]) -> Tuple[int, str, str]:
     env = _base_env()
+    # Ensure user config skeleton exists to avoid the startup "Configuration wasn't found" guard
+    _ensure_minimal_user_config(env)
     base = ["xvfb-run", "-a", "-s", "-screen 0 1024x768x24", PRUSA_APPIMAGE]
     cmd_list = base + args
     cmd_str = " ".join(shlex.quote(x) for x in cmd_list)
@@ -163,12 +190,54 @@ def _resolve_datadir_opt_in() -> Optional[str]:
     if forced and os.path.isdir(forced):
         return forced
     if os.environ.get("PS_FORCE_DATADIR") and not (forced and os.path.isdir(forced)):
-        # Surface a clear message in logs if a bad path was set.
         print(f"PS_FORCE_DATADIR was set but not a valid directory: {os.environ.get('PS_FORCE_DATADIR')!r}")
     return None
 
 def _maybe_with_datadir(args: List[str], datadir: Optional[str]) -> List[str]:
     return (["--datadir", datadir] if datadir else []) + args
+
+# ---------- Bundle flattening (build a one-file CLI config) ----------
+def _extract_section(text: str, kind: str, name: str) -> Dict[str, str]:
+    """
+    Grab lines from a [kind:name] section of a PrusaSlicer bundle and return as key->value.
+    Lines that are comments/blank are ignored.
+    """
+    pat = re.compile(rf"^\[{re.escape(kind)}:{re.escape(name)}\]\s*([\s\S]*?)(?=^\[|\Z)", re.M)
+    m = pat.search(text)
+    if not m:
+        return {}
+    block = m.group(1)
+    out: Dict[str, str] = {}
+    for ln in block.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith(";") or ln.startswith("#") or ln.startswith("["):
+            continue
+        if "=" in ln:
+            k, v = ln.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+def materialize_cli_config(bundle_path: str, printer_name: str, print_name: str, material_name: str, dest_dir: str) -> Path:
+    """
+    Build a one-file CLI config where all options are flattened (no profile registry required).
+    Order of precedence: printer -> sla_print -> sla_material (later overrides earlier).
+    """
+    txt = Path(bundle_path).read_text(errors="ignore")
+    merged: Dict[str, str] = {}
+    for kind, name in (("printer", printer_name), ("sla_print", print_name), ("sla_material", material_name)):
+        section = _extract_section(txt, kind, name)
+        if not section:
+            raise HTTPException(status_code=400, detail=f"Missing section [{kind}:{name}] in bundle")
+        merged.update(section)
+
+    # Ensure SLA mode is explicit to avoid accidental FFF defaults
+    merged.setdefault("printer_technology", "SLA")
+
+    out = Path(dest_dir) / "merged_cli.ini"
+    with out.open("w") as f:
+        for k, v in merged.items():
+            f.write(f"{k} = {v}\n")
+    return out
 
 # ---------- Health/Readiness ----------
 @app.get("/healthz")
@@ -216,7 +285,6 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             # Resolve optional datadir (only if PS_FORCE_DATADIR is set and valid)
             datadir = _resolve_datadir_opt_in()
             if os.environ.get("PS_FORCE_DATADIR") and not datadir:
-                # Fail early if an explicit override was requested but invalid.
                 update_job(
                     job_id,
                     status="failed",
@@ -258,7 +326,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             bundle_local = preset["bundle_local"]
             params_local = preset["params_local"]
 
-            # Preflight (banner check). Datadir is optional.
+            # Preflight (banner check). Datadir is optional (usually None).
             rc0, log0, cmd0 = run_prusaslicer_headless(_maybe_with_datadir(["--help"], datadir))
             if ("PrusaSlicer" not in (log0 or "")) and (rc0 != 0):
                 update_job(job_id, status="failed", error=f"prusaslicer_boot_failed rc={rc0}\nCMD: {cmd0}\n{(log0 or '')[-4000:]}")
@@ -267,46 +335,50 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             out_dir = os.path.join(wd, "out")
             os.makedirs(out_dir, exist_ok=True)
 
+            # Flatten profiles into a single CLI config (no profile registry needed)
             printer_name     = row["printer_profile_name"]
             print_profile    = job.get("print_profile")    or row["print_profile_name"]
             material_profile = job.get("material_profile") or row["material_profile_name"]
 
+            try:
+                merged_cli_ini = materialize_cli_config(
+                    bundle_local,
+                    printer_name,
+                    print_profile,
+                    material_profile,
+                    dest_dir=wd
+                )
+            except HTTPException as he:
+                update_job(job_id, status="failed", error=f"bundle_section_missing: {he.detail}")
+                return {"ok": False, "error": "bundle_section_missing"}
+
             attempts: List[List[str]] = []
 
-            # Attempt 1: export SLA (PNG layers)
+            # 1) export SLA PNGs (primary path)
             attempts.append(_maybe_with_datadir([
                 "--export-sla",
                 "--loglevel", "3",
                 "--output", out_dir,
-                "--load", bundle_local,
-                "--printer-profile", printer_name,
-                "--print-profile", print_profile,
-                "--material-profile", material_profile,
+                "--load", str(merged_cli_ini),
                 input_model
             ], datadir))
 
-            # Attempt 2: slice (alternate path)
+            # 2) plain slice (secondary path)
             attempts.append(_maybe_with_datadir([
                 "--slice",
                 "--loglevel", "3",
                 "--output", out_dir,
-                "--load", bundle_local,
-                "--printer-profile", printer_name,
-                "--print-profile", print_profile,
-                "--material-profile", material_profile,
+                "--load", str(Merged_cli_ini) if False else str(merged_cli_ini),  # keep structure; no named profiles
                 input_model
             ], datadir))
 
-            # Attempt 3: export project as last resort
+            # 3) export a project as last resort
             project_out = os.path.join(out_dir, "project.3mf")
             attempts.append(_maybe_with_datadir([
                 "--export-3mf",
                 "--loglevel", "3",
                 "--output", project_out,
-                "--load", bundle_local,
-                "--printer-profile", printer_name,
-                "--print-profile", print_profile,
-                "--material-profile", material_profile,
+                "--load", str(merged_cli_ini),
                 input_model
             ], datadir))
 
