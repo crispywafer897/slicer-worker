@@ -1,6 +1,6 @@
 import os, subprocess, shutil, json, tempfile, zipfile, urllib.request, glob, shlex, hashlib, textwrap, re
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, List
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
@@ -18,7 +18,8 @@ STORAGE_BUCKET = os.environ.get("STORAGE_BUCKET", "slicer-presets")
 CACHE_DIR = Path(os.environ.get("CACHE_DIR", "/tmp/preset_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# Where the AppImage symlink was installed by your Dockerfile (extracted AppRun)
+# Where the AppImage (extracted AppRun) was installed by your Dockerfile.
+# You said you extracted with --appimage-extract to /opt/prusaslicer and symlinked to /usr/local/bin/prusaslicer.
 PRUSA_APPIMAGE = "/usr/local/bin/prusaslicer"
 
 # Acceptable model file extensions PrusaSlicer can ingest headlessly
@@ -152,12 +153,8 @@ def merge_overrides(params_path: Path, overrides: Optional[Dict[str, Any]]) -> P
     merged_path.write_text(json.dumps(params))
     return merged_path
 
-# ---------- PrusaSlicer runner (AppImage, headless) ----------
-def run_prusaslicer_headless(args: list[str]) -> tuple[int, str, str]:
-    """
-    Run PrusaSlicer AppImage headlessly with xvfb-run.
-    Returns (rc, combined_output, rendered_command_str) for better error logs.
-    """
+# ---------- PrusaSlicer runner & datadir probing ----------
+def _base_env() -> dict:
     env = os.environ.copy()
     # Helpful in containerized headless environments:
     env.setdefault("NO_AT_BRIDGE", "1")            # avoid a11y D-Bus probing
@@ -169,12 +166,73 @@ def run_prusaslicer_headless(args: list[str]) -> tuple[int, str, str]:
     env.setdefault("HOME", ps_home)
     env.setdefault("XDG_CONFIG_HOME", os.path.join(ps_home, ".config"))
     env.setdefault("XDG_CACHE_HOME", os.path.join(ps_home, ".cache"))
+    return env
 
+def run_prusaslicer_headless(args: List[str]) -> Tuple[int, str, str]:
+    """
+    Run PrusaSlicer AppImage headlessly with xvfb-run.
+    Returns (rc, combined_output, rendered_command_str) for better error logs.
+    """
+    env = _base_env()
     base = ["xvfb-run", "-a", "-s", "-screen 0 1024x768x24", PRUSA_APPIMAGE]
     cmd_list = base + args
     cmd_str = " ".join(shlex.quote(x) for x in cmd_list)
     rc, log = sh(cmd_str, env=env)
     return rc, log, cmd_str
+
+def _probe_datadir_candidates() -> Tuple[Optional[str], List[str]]:
+    """
+    Try reasonable datadir locations and pick the first that does NOT print
+    'Configuration wasn't found' on a simple command (e.g., --help).
+    Returns (chosen_datadir, tried_list)
+    """
+    tried = []
+    # 1) Explicit override via env (lets you force a path in Docker)
+    override = os.environ.get("PRUSA_DATADIR")
+    if override:
+        tried.append(override)
+
+    # 2) Paths relative to the resolved AppRun / binary
+    try:
+        resolved = Path(PRUSA_APPIMAGE).resolve()
+    except Exception:
+        resolved = Path(PRUSA_APPIMAGE)
+    base = resolved.parent
+
+    # Common folders in extracted AppImage or distro packages
+    candidates = [
+        # Typical extracted AppImage layout under /opt/prusaslicer
+        base / "../share/prusa-slicer",
+        base / "../share/PrusaSlicer",
+        base / "../Resources",
+        base / "../../share/prusa-slicer",
+        base / "../../share/PrusaSlicer",
+        # Fallbacks if you followed the doc example exactly
+        Path("/opt/prusaslicer/usr/share/prusa-slicer"),
+        Path("/opt/prusaslicer/usr/share/PrusaSlicer"),
+        Path("/opt/prusaslicer/share/prusa-slicer"),
+        Path("/opt/prusaslicer/share/PrusaSlicer"),
+    ]
+
+    # Coerce to strings & unique
+    for c in candidates:
+        cstr = str(Path(c).resolve())
+        if cstr not in tried:
+            tried.append(cstr)
+
+    # Probe each by calling prusaslicer with --datadir <candidate> --help
+    for c in tried:
+        # Only consider existing directories to cut noise; we still validate via run
+        if not os.path.isdir(c):
+            continue
+        rc, log, _ = run_prusaslicer_headless(["--datadir", c, "--help"])
+        if "Configuration wasn't found" in (log or ""):
+            continue
+        # We consider it good if PrusaSlicer banner appears and no 'not found'
+        if "PrusaSlicer" in (log or ""):
+            return c, tried
+
+    return None, tried
 
 # ---------- Health/Readiness ----------
 @app.get("/healthz")
@@ -183,12 +241,15 @@ def healthz():
 
 @app.get("/ready")
 def ready():
+    chosen, tried = _probe_datadir_candidates()
     return {
-        "ok": bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and WORKER_TOKEN),
+        "ok": bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and WORKER_TOKEN and chosen),
         "has_SUPABASE_URL": bool(SUPABASE_URL),
         "has_SERVICE_ROLE": bool(SUPABASE_SERVICE_ROLE_KEY),
         "has_WORKER_TOKEN": bool(WORKER_TOKEN),
         "storage_bucket": STORAGE_BUCKET,
+        "datadir": chosen,
+        "datadir_tried": tried[:6],  # keep short
     }
 
 # ---------- Main job endpoint ----------
@@ -227,6 +288,18 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
         # Workspace
         wd = tempfile.mkdtemp(prefix=f"job_{job_id}_")
         try:
+            # 0) Resolve a valid PrusaSlicer datadir
+            datadir, tried = _probe_datadir_candidates()
+            if not datadir:
+                update_job(
+                    job_id,
+                    status="failed",
+                    error=textwrap.dedent(f"""prusaslicer_datadir_not_found
+PRUSA_APPIMAGE={PRUSA_APPIMAGE}
+Tried datadirs: {tried}"""),
+                )
+                return {"ok": False, "error": "prusaslicer_datadir_not_found"}
+
             # 1) Input model (spec is "bucket:path/in/bucket.ext")
             in_spec = job["input_path"]
             if ":" not in in_spec:
@@ -267,8 +340,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             params_local = preset["params_local"]
 
             # 2b) Preflight: ensure PrusaSlicer binary is runnable
-            # NOTE: 2.8.1 may not support --version; parse first lines of --help instead.
-            rc0, log0, cmd0 = run_prusaslicer_headless(["--help"])
+            rc0, log0, cmd0 = run_prusaslicer_headless(["--datadir", datadir, "--help"])
             if ("PrusaSlicer" not in (log0 or "")) and (rc0 != 0):
                 update_job(job_id, status="failed", error=f"prusaslicer_boot_failed rc={rc0}\nCMD: {cmd0}\n{(log0 or '')[-4000:]}")
                 return {"ok": False, "error": "prusaslicer_boot_failed"}
@@ -281,11 +353,12 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             print_profile    = job.get("print_profile")    or row["print_profile_name"]
             material_profile = job.get("material_profile") or row["material_profile_name"]
 
-            attempts: list[list[str]] = []
+            attempts: List[List[str]] = []
 
             # A) SLA export with explicit presets, --output (directory). PNG is default for SLA.
             attempts.append([
                 "--export-sla",
+                "--datadir", datadir,
                 "--loglevel", "3",
                 "--output", out_dir,
                 "--load", bundle_local,
@@ -298,6 +371,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             # B) Explicit "slice" action (some headless paths prefer this). Keep all three profiles.
             attempts.append([
                 "--slice",
+                "--datadir", datadir,
                 "--loglevel", "3",
                 "--output", out_dir,
                 "--load", bundle_local,
@@ -311,6 +385,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             project_out = os.path.join(out_dir, "project.3mf")
             attempts.append([
                 "--export-3mf",
+                "--datadir", datadir,
                 "--loglevel", "3",
                 "--output", project_out,  # single file path is correct for --export-3mf
                 "--load", bundle_local,
@@ -325,8 +400,8 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             attempt_logs = []
             full_logs = []   # capture full logs for the report
 
-            # Record the PS version-ish header for context
-            v_rc, v_log, v_cmd = run_prusaslicer_headless(["--help"])
+            # Record the PS banner for context
+            v_rc, v_log, v_cmd = run_prusaslicer_headless(["--datadir", datadir, "--help"])
             ps_version = (v_log or "").strip().splitlines()[:3]
 
             cmd1, log1 = "", ""
@@ -348,7 +423,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 # Introspect bundle to show available preset names (debug without terminal)
                 presets_available = list_bundle_presets(bundle_local)
                 # Also capture SLA help to include exact flags for this version
-                rc_help, log_help, cmd_help = run_prusaslicer_headless(["--help-sla"])
+                rc_help, log_help, cmd_help = run_prusaslicer_headless(["--datadir", datadir, "--help-sla"])
                 update_job(
                     job_id,
                     status="failed",
@@ -356,6 +431,9 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
 ps_version: {ps_version}
 printer_id: {printer_id}
 bundle: {row['bundle_path']}  params: {row['uvtools_params_path']}
+chosen_datadir: {datadir}
+datadir_tried: {tried}
+
 presets_requested:
   printer={printer_name}
   print={print_profile}
