@@ -1,4 +1,4 @@
-import os, subprocess, shutil, json, tempfile, zipfile, urllib.request, glob, shlex, hashlib, textwrap, re
+import os, subprocess, shutil, json, tempfile, zipfile, urllib.request, glob, shlex, hashlib, textwrap, re, time
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -24,6 +24,9 @@ PRUSA_APPIMAGE = "/usr/local/bin/prusaslicer"
 
 # Acceptable model file extensions PrusaSlicer can ingest headlessly
 ALLOWED_MODEL_EXTS = {".stl", ".3mf", ".obj", ".amf"}
+
+# Known native resin formats PrusaSlicer/UVtools may produce
+NATIVE_EXTS = (".pwmx", ".ctb", ".ctb2", ".ctb7", ".photon", ".phz", ".cbddlp", ".sl1", ".sl1s", ".pw0", ".pws")
 
 # Allow-list of UVtools param keys that jobs may override safely
 ALLOWLIST_OVERRIDE_KEYS = {
@@ -74,6 +77,7 @@ def upload_file(bucket: str, path: str, local_path: str, content_type: str):
         _supabase().storage.from_(bucket).upload(path, f, {"content-type": content_type, "upsert": True})
 
 def find_layers(base_dir: str) -> Optional[str]:
+    # common PrusaSlicer SLA outputs
     for candidate in (os.path.join(base_dir, "slices"), os.path.join(base_dir, "sla")):
         if os.path.isdir(candidate) and glob.glob(os.path.join(candidate, "*.png")):
             return candidate
@@ -83,6 +87,21 @@ def find_layers(base_dir: str) -> Optional[str]:
         if count > best_count:
             best_dir, best_count = root, count
     return best_dir if best_count > 0 else None
+
+def find_native_artifact(base_dir: str) -> Optional[str]:
+    """
+    If PrusaSlicer exported a native resin file directly (e.g., .pwmx, .ctb, .sl1),
+    return the newest such file path; else None.
+    """
+    candidates: List[str] = []
+    for root, _, files in os.walk(base_dir):
+        for fn in files:
+            if fn.lower().endswith(NATIVE_EXTS):
+                candidates.append(os.path.join(root, fn))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: os.path.getmtime(p))
+    return candidates[-1]
 
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()
@@ -352,9 +371,8 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 update_job(job_id, status="failed", error=f"bundle_section_missing: {he.detail}")
                 return {"ok": False, "error": "bundle_section_missing"}
 
+            # Attempts (we keep your three-stage strategy)
             attempts: List[List[str]] = []
-
-            # 1) export SLA PNGs (primary path)
             attempts.append(_maybe_with_datadir([
                 "--export-sla",
                 "--loglevel", "3",
@@ -362,17 +380,13 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 "--load", str(merged_cli_ini),
                 input_model
             ], datadir))
-
-            # 2) plain slice (secondary path)
             attempts.append(_maybe_with_datadir([
                 "--slice",
                 "--loglevel", "3",
                 "--output", out_dir,
-                "--load", str(Merged_cli_ini) if False else str(merged_cli_ini),  # keep structure; no named profiles
+                "--load", str(merged_cli_ini),
                 input_model
             ], datadir))
-
-            # 3) export a project as last resort
             project_out = os.path.join(out_dir, "project.3mf")
             attempts.append(_maybe_with_datadir([
                 "--export-3mf",
@@ -440,7 +454,54 @@ presets_available:
 """))
                 return {"ok": False, "error": "prusaslicer_failed"}
 
-            # If we only produced a 3mf, continue; UVtools needs PNG slices though.
+            # --- New: accept native artifacts directly if PrusaSlicer produced them ---
+            native_found = find_native_artifact(out_dir)
+            if native_found:
+                # Optional: sanity delay in case filesystem timestamps race
+                try:
+                    time.sleep(0.02)
+                except Exception:
+                    pass
+                # Try to zip layers if PNGs also exist; otherwise skip quietly
+                slices_dir_opt = find_layers(out_dir)
+                zip_path = None
+                if slices_dir_opt:
+                    zip_path = os.path.join(out_dir, "layers.zip")
+                    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+                        for fn in sorted(glob.glob(os.path.join(slices_dir_opt, "*.png"))):
+                            z.write(fn, arcname=os.path.basename(fn))
+
+                native_ext = Path(native_found).suffix.lstrip(".")
+                job_prefix = str(job_id)
+
+                def up(bucket_name: str, path: str, local: str, ctype: str):
+                    with open(local, "rb") as f:
+                        _supabase().storage.from_(bucket_name).upload(path, f, {"content-type": ctype, "upsert": True})
+
+                up("native",   f"{job_prefix}/print.{native_ext}", native_found, "application/octet-stream")
+                proj = next((f for f in os.listdir(out_dir) if f.endswith(".3mf")), None)
+                if proj:
+                    up("projects", f"{job_prefix}/{proj}", os.path.join(out_dir, proj), "model/3mf")
+                if zip_path:
+                    up("slices",   f"{job_prefix}/layers.zip", zip_path, "application/zip")
+
+                report = {
+                    "native_ext": native_ext,
+                    "native_source": "prusaslicer",
+                    "layers": len(glob.glob(os.path.join(slices_dir_opt, "*.png"))) if slices_dir_opt else 0
+                }
+                update_job(
+                    job_id,
+                    status="succeeded",
+                    report=report,
+                    output_native_path=f"native:{job_prefix}/print.{native_ext}",
+                    output_project_path=(f"projects:{job_prefix}/{proj}" if proj else None),
+                    output_slices_zip_path=(f"slices:{job_prefix}/layers.zip" if zip_path else None),
+                    error=None,
+                )
+                return {"ok": True}
+
+            # --- Original path: rely on PNG slices + UVtools pack ---
             slices_dir = find_layers(out_dir)
             if not slices_dir:
                 update_job(job_id, status="failed", error=f"no_slices_found in {out_dir}.\nCMD: {cmd1}\nPrusa log tail:\n{(log1 or '')[-4000:]}")
@@ -481,7 +542,11 @@ presets_available:
                 up("projects", f"{job_prefix}/{proj}", os.path.join(out_dir, proj), "model/3mf")
             up("slices",   f"{job_prefix}/layers.zip", zip_path, "application/zip")
 
-            report = {"layers": len(glob.glob(os.path.join(slices_dir, "*.png")))}
+            report = {
+                "native_ext": native_ext,
+                "native_source": "uvtools",
+                "layers": len(glob.glob(os.path.join(slices_dir, "*.png")))
+            }
             update_job(
                 job_id,
                 status="succeeded",
