@@ -19,6 +19,7 @@ CACHE_DIR = Path(os.environ.get("CACHE_DIR", "/tmp/preset_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Where the AppImage (extracted AppRun) was installed by your Dockerfile.
+# Dockerfile symlinks /opt/prusaslicer/AppRun -> /usr/local/bin/prusaslicer
 PRUSA_APPIMAGE = "/usr/local/bin/prusaslicer"
 
 # Acceptable model file extensions PrusaSlicer can ingest headlessly
@@ -30,6 +31,10 @@ ALLOWLIST_OVERRIDE_KEYS = {
     "light_off_delay_s", "lift_height_mm", "lift_speed_mm_s", "retract_speed_mm_s",
     "anti_aliasing"
 }
+
+# Note: We intentionally ignore legacy PRUSA_DATADIR unless explicitly opted-in via PS_FORCE_DATADIR.
+if os.environ.get("PRUSA_DATADIR") and not os.environ.get("PS_FORCE_DATADIR"):
+    print("Note: Ignoring PRUSA_DATADIR; use PS_FORCE_DATADIR to opt-in to a custom data directory.")
 
 app = FastAPI()
 
@@ -127,7 +132,7 @@ def merge_overrides(params_path: Path, overrides: Optional[Dict[str, Any]]) -> P
     merged_path.write_text(json.dumps(params))
     return merged_path
 
-# ---------- PrusaSlicer runner & datadir probing ----------
+# ---------- PrusaSlicer runner & env ----------
 def _base_env() -> dict:
     env = os.environ.copy()
     env.setdefault("NO_AT_BRIDGE", "1")
@@ -148,101 +153,22 @@ def run_prusaslicer_headless(args: List[str]) -> Tuple[int, str, str]:
     rc, log = sh(cmd_str, env=env)
     return rc, log, cmd_str
 
-# --- NEW: robust datadir validation ---
-def _is_valid_datadir(p: str) -> bool:
+# ---------- Datadir behavior (opt-in only) ----------
+def _resolve_datadir_opt_in() -> Optional[str]:
     """
-    Quick static checks to avoid bogus hits (like /usr/bin/resources).
-    We require the directory to contain at least two of these markers:
-      - profiles/   - vendor/   - shaders/   - icons/   - localization/
+    Only honor an explicit opt-in env var. Ignore PRUSA_DATADIR and
+    do NOT scan install paths. Default to None so we don't pass --datadir.
     """
-    if not p or not os.path.isdir(p):
-        return False
-    bad_parts = ("/bin/", "/sbin/")
-    if any(bp in (p + "/") for bp in bad_parts):
-        return False
-    markers = 0
-    for name in ("profiles", "vendor", "shaders", "icons", "localization"):
-        if os.path.isdir(os.path.join(p, name)):
-            markers += 1
-    return markers >= 2
+    forced = os.environ.get("PS_FORCE_DATADIR")
+    if forced and os.path.isdir(forced):
+        return forced
+    if os.environ.get("PS_FORCE_DATADIR") and not (forced and os.path.isdir(forced)):
+        # Surface a clear message in logs if a bad path was set.
+        print(f"PS_FORCE_DATADIR was set but not a valid directory: {os.environ.get('PS_FORCE_DATADIR')!r}")
+    return None
 
-def _probe_datadir_candidates() -> Tuple[Optional[str], List[str]]:
-    """
-    Pick a datadir by:
-      1) trusting PRUSA_DATADIR if it exists and looks valid,
-      2) trying stable/common locations,
-      3) scanning under /opt/prusaslicer for likely resource roots,
-    then confirming with a --help banner check.
-    """
-    tried: List[str] = []
-
-    # 0) Respect explicit override if it passes static checks
-    override = os.environ.get("PRUSA_DATADIR")
-    if override:
-        tried.append(override)
-        if _is_valid_datadir(override):
-            return override, tried
-
-    # 1) Start from resolved AppRun
-    try:
-        resolved = Path(PRUSA_APPIMAGE).resolve()
-    except Exception:
-        resolved = Path(PRUSA_APPIMAGE)
-    base = resolved.parent
-
-    # 2) Preferred stable locations (Dockerfile created a symlink to this)
-    candidates: List[str] = []
-    for c in [
-        base / "../share/prusa-slicer",
-        base / "../share/PrusaSlicer",
-        Path("/opt/prusaslicer/usr/share/prusa-slicer"),
-        Path("/opt/prusaslicer/usr/share/PrusaSlicer"),
-        Path("/opt/prusaslicer/share/prusa-slicer"),
-        Path("/opt/prusaslicer/share/PrusaSlicer"),
-        Path("/opt/prusaslicer/resources"),
-        Path("/opt/prusaslicer/Resources"),
-        Path("/opt/prusaslicer/usr/resources"),
-        Path("/opt/prusaslicer/usr/Resources"),
-        Path("/opt/prusaslicer/usr/lib/PrusaSlicer/resources"),
-        Path("/opt/prusaslicer/usr/lib64/PrusaSlicer/resources"),
-    ]:
-        cs = str(Path(c).resolve())
-        if cs not in candidates:
-            candidates.append(cs)
-
-    # 3) Scan under /opt/prusaslicer up to depth 5 for dirs named like resources roots
-    root = Path("/opt/prusaslicer")
-    if root.exists():
-        for p in root.rglob("*"):
-            try:
-                if not p.is_dir():
-                    continue
-                name = p.name
-                # ignore obviously wrong trees
-                pstr = str(p.resolve())
-                if "/bin/" in pstr or "/sbin/" in pstr:
-                    continue
-                if name in ("prusa-slicer", "PrusaSlicer", "resources", "Resources"):
-                    if pstr not in candidates:
-                        candidates.append(pstr)
-            except Exception:
-                continue
-
-    # 4) Evaluate candidates with static markers first
-    stat_ok = [p for p in candidates if _is_valid_datadir(p)]
-    tried.extend(candidates)
-
-    # 5) Confirm with a light runtime check (banner, and no 'Configuration wasn't found')
-    for c in stat_ok:
-        rc, log, _ = run_prusaslicer_headless(["--datadir", c, "--help"])
-        if "PrusaSlicer" in (log or "") and "Configuration wasn't found" not in (log or ""):
-            return c, tried
-
-    # If nothing passes runtime check, but override existed and stat-ok, use it anyway to aid debugging.
-    if override and _is_valid_datadir(override):
-        return override, tried
-
-    return None, tried
+def _maybe_with_datadir(args: List[str], datadir: Optional[str]) -> List[str]:
+    return (["--datadir", datadir] if datadir else []) + args
 
 # ---------- Health/Readiness ----------
 @app.get("/healthz")
@@ -251,15 +177,14 @@ def healthz():
 
 @app.get("/ready")
 def ready():
-    chosen, tried = _probe_datadir_candidates()
+    forced = _resolve_datadir_opt_in()
     return {
-        "ok": bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and WORKER_TOKEN and chosen),
+        "ok": bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY and WORKER_TOKEN),
         "has_SUPABASE_URL": bool(SUPABASE_URL),
         "has_SERVICE_ROLE": bool(SUPABASE_SERVICE_ROLE_KEY),
         "has_WORKER_TOKEN": bool(WORKER_TOKEN),
         "storage_bucket": STORAGE_BUCKET,
-        "datadir": chosen,
-        "datadir_tried": tried[:12],
+        "datadir": forced or "(none; using default user config under $HOME)",
     }
 
 # ---------- Main job endpoint ----------
@@ -288,17 +213,16 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
 
         wd = tempfile.mkdtemp(prefix=f"job_{job_id}_")
         try:
-            # Resolve valid datadir
-            datadir, tried = _probe_datadir_candidates()
-            if not datadir:
+            # Resolve optional datadir (only if PS_FORCE_DATADIR is set and valid)
+            datadir = _resolve_datadir_opt_in()
+            if os.environ.get("PS_FORCE_DATADIR") and not datadir:
+                # Fail early if an explicit override was requested but invalid.
                 update_job(
                     job_id,
                     status="failed",
-                    error=textwrap.dedent(f"""prusaslicer_datadir_not_found
-PRUSA_APPIMAGE={PRUSA_APPIMAGE}
-Tried datadirs: {tried}"""),
+                    error=f"ps_force_datadir_invalid: PS_FORCE_DATADIR={os.environ.get('PS_FORCE_DATADIR')!r} is not a directory"
                 )
-                return {"ok": False, "error": "prusaslicer_datadir_not_found"}
+                return {"ok": False, "error": "ps_force_datadir_invalid"}
 
             # Input model
             in_spec = job["input_path"]
@@ -334,8 +258,8 @@ Tried datadirs: {tried}"""),
             bundle_local = preset["bundle_local"]
             params_local = preset["params_local"]
 
-            # Preflight
-            rc0, log0, cmd0 = run_prusaslicer_headless(["--datadir", datadir, "--help"])
+            # Preflight (banner check). Datadir is optional.
+            rc0, log0, cmd0 = run_prusaslicer_headless(_maybe_with_datadir(["--help"], datadir))
             if ("PrusaSlicer" not in (log0 or "")) and (rc0 != 0):
                 update_job(job_id, status="failed", error=f"prusaslicer_boot_failed rc={rc0}\nCMD: {cmd0}\n{(log0 or '')[-4000:]}")
                 return {"ok": False, "error": "prusaslicer_boot_failed"}
@@ -349,9 +273,9 @@ Tried datadirs: {tried}"""),
 
             attempts: List[List[str]] = []
 
-            attempts.append([
+            # Attempt 1: export SLA (PNG layers)
+            attempts.append(_maybe_with_datadir([
                 "--export-sla",
-                "--datadir", datadir,
                 "--loglevel", "3",
                 "--output", out_dir,
                 "--load", bundle_local,
@@ -359,11 +283,11 @@ Tried datadirs: {tried}"""),
                 "--print-profile", print_profile,
                 "--material-profile", material_profile,
                 input_model
-            ])
+            ], datadir))
 
-            attempts.append([
+            # Attempt 2: slice (alternate path)
+            attempts.append(_maybe_with_datadir([
                 "--slice",
-                "--datadir", datadir,
                 "--loglevel", "3",
                 "--output", out_dir,
                 "--load", bundle_local,
@@ -371,12 +295,12 @@ Tried datadirs: {tried}"""),
                 "--print-profile", print_profile,
                 "--material-profile", material_profile,
                 input_model
-            ])
+            ], datadir))
 
+            # Attempt 3: export project as last resort
             project_out = os.path.join(out_dir, "project.3mf")
-            attempts.append([
+            attempts.append(_maybe_with_datadir([
                 "--export-3mf",
-                "--datadir", datadir,
                 "--loglevel", "3",
                 "--output", project_out,
                 "--load", bundle_local,
@@ -384,14 +308,14 @@ Tried datadirs: {tried}"""),
                 "--print-profile", print_profile,
                 "--material-profile", material_profile,
                 input_model
-            ])
+            ], datadir))
 
             success = False
             produced_project = False
             attempt_logs: List[str] = []
             full_logs: List[str] = []
 
-            v_rc, v_log, v_cmd = run_prusaslicer_headless(["--datadir", datadir, "--help"])
+            v_rc, v_log, v_cmd = run_prusaslicer_headless(_maybe_with_datadir(["--help"], datadir))
             ps_version = (v_log or "").strip().splitlines()[:3]
 
             cmd1, log1 = "", ""
@@ -411,7 +335,7 @@ Tried datadirs: {tried}"""),
 
             if not success:
                 presets_available = list_bundle_presets(bundle_local)
-                rc_help, log_help, cmd_help = run_prusaslicer_headless(["--datadir", datadir, "--help-sla"])
+                rc_help, log_help, cmd_help = run_prusaslicer_headless(_maybe_with_datadir(["--help-sla"], datadir))
                 update_job(
                     job_id,
                     status="failed",
@@ -419,7 +343,7 @@ Tried datadirs: {tried}"""),
 ps_version: {ps_version}
 printer_id: {printer_id}
 bundle: {row['bundle_path']}  params: {row['uvtools_params_path']}
-chosen_datadir: {datadir}
+chosen_datadir: {datadir or "(none; default user config under $HOME)"}
 
 presets_requested:
   printer={printer_name}
@@ -444,9 +368,7 @@ presets_available:
 """))
                 return {"ok": False, "error": "prusaslicer_failed"}
 
-            if produced_project:
-                pass
-
+            # If we only produced a 3mf, continue; UVtools needs PNG slices though.
             slices_dir = find_layers(out_dir)
             if not slices_dir:
                 update_job(job_id, status="failed", error=f"no_slices_found in {out_dir}.\nCMD: {cmd1}\nPrusa log tail:\n{(log1 or '')[-4000:]}")
