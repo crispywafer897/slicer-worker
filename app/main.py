@@ -19,7 +19,7 @@ CACHE_DIR = Path(os.environ.get("CACHE_DIR", "/tmp/preset_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Where the AppImage (extracted AppRun) was installed by your Dockerfile.
-# You said you extracted with --appimage-extract to /opt/prusaslicer and symlinked to /usr/local/bin/prusaslicer.
+# You extracted with --appimage-extract to /opt/prusaslicer and symlinked to /usr/local/bin/prusaslicer.
 PRUSA_APPIMAGE = "/usr/local/bin/prusaslicer"
 
 # Acceptable model file extensions PrusaSlicer can ingest headlessly
@@ -186,51 +186,63 @@ def _probe_datadir_candidates() -> Tuple[Optional[str], List[str]]:
     'Configuration wasn't found' on a simple command (e.g., --help).
     Returns (chosen_datadir, tried_list)
     """
-    tried = []
-    # 1) Explicit override via env (lets you force a path in Docker)
+    tried: List[str] = []
+
+    # 0) Respect explicit override
     override = os.environ.get("PRUSA_DATADIR")
     if override:
         tried.append(override)
 
-    # 2) Paths relative to the resolved AppRun / binary
+    # 1) Start from where AppRun lives
     try:
         resolved = Path(PRUSA_APPIMAGE).resolve()
     except Exception:
         resolved = Path(PRUSA_APPIMAGE)
     base = resolved.parent
 
-    # Common folders in extracted AppImage or distro packages
-    candidates = [
-        # Typical extracted AppImage layout under /opt/prusaslicer
+    # 2) Known relative locations from extracted AppImage
+    candidates: List[Path] = [
         base / "../share/prusa-slicer",
         base / "../share/PrusaSlicer",
-        base / "../Resources",
-        base / "../../share/prusa-slicer",
-        base / "../../share/PrusaSlicer",
-        # Fallbacks if you followed the doc example exactly
         Path("/opt/prusaslicer/usr/share/prusa-slicer"),
         Path("/opt/prusaslicer/usr/share/PrusaSlicer"),
         Path("/opt/prusaslicer/share/prusa-slicer"),
         Path("/opt/prusaslicer/share/PrusaSlicer"),
     ]
 
-    # Coerce to strings & unique
-    for c in candidates:
-        cstr = str(Path(c).resolve())
-        if cstr not in tried:
-            tried.append(cstr)
+    # 3) Recursively search under /opt/prusaslicer for */share/(prusa-slicer|PrusaSlicer)
+    root = Path("/opt/prusaslicer")
+    if root.exists():
+        # Limit depth to keep it cheap
+        for p in root.rglob("*"):
+            try:
+                if p.is_dir() and p.name in ("prusa-slicer", "PrusaSlicer") and p.parent.name == "share":
+                    candidates.append(p)
+            except Exception:
+                continue
 
-    # Probe each by calling prusaslicer with --datadir <candidate> --help
-    for c in tried:
-        # Only consider existing directories to cut noise; we still validate via run
+    # De-dup to strings
+    seen = set()
+    canon: List[str] = []
+    for c in candidates:
+        s = str(Path(c).resolve())
+        if s not in seen:
+            seen.add(s)
+            canon.append(s)
+
+    tried.extend(canon)
+
+    # Verify by running --help with each datadir
+    for c in canon:
         if not os.path.isdir(c):
             continue
         rc, log, _ = run_prusaslicer_headless(["--datadir", c, "--help"])
-        if "Configuration wasn't found" in (log or ""):
-            continue
-        # We consider it good if PrusaSlicer banner appears and no 'not found'
-        if "PrusaSlicer" in (log or ""):
+        if rc == 0 and "PrusaSlicer" in (log or "") and "Configuration wasn't found" not in (log or ""):
             return c, tried
+
+    # Last resort: if override was set but verification failed, still return it so error shows it first
+    if override:
+        return override, tried
 
     return None, tried
 
@@ -249,7 +261,7 @@ def ready():
         "has_WORKER_TOKEN": bool(WORKER_TOKEN),
         "storage_bucket": STORAGE_BUCKET,
         "datadir": chosen,
-        "datadir_tried": tried[:6],  # keep short
+        "datadir_tried": tried[:10],  # keep short
     }
 
 # ---------- Main job endpoint ----------
@@ -339,7 +351,7 @@ Tried datadirs: {tried}"""),
             bundle_local = preset["bundle_local"]
             params_local = preset["params_local"]
 
-            # 2b) Preflight: ensure PrusaSlicer binary is runnable
+            # 2b) Preflight: ensure PrusaSlicer binary is runnable with this datadir
             rc0, log0, cmd0 = run_prusaslicer_headless(["--datadir", datadir, "--help"])
             if ("PrusaSlicer" not in (log0 or "")) and (rc0 != 0):
                 update_job(job_id, status="failed", error=f"prusaslicer_boot_failed rc={rc0}\nCMD: {cmd0}\n{(log0 or '')[-4000:]}")
@@ -432,8 +444,6 @@ ps_version: {ps_version}
 printer_id: {printer_id}
 bundle: {row['bundle_path']}  params: {row['uvtools_params_path']}
 chosen_datadir: {datadir}
-datadir_tried: {tried}
-
 presets_requested:
   printer={printer_name}
   print={print_profile}
