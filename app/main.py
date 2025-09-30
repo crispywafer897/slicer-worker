@@ -19,7 +19,6 @@ CACHE_DIR = Path(os.environ.get("CACHE_DIR", "/tmp/preset_cache"))
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Where the AppImage (extracted AppRun) was installed by your Dockerfile.
-# You extracted with --appimage-extract to /opt/prusaslicer and symlinked to /usr/local/bin/prusaslicer.
 PRUSA_APPIMAGE = "/usr/local/bin/prusaslicer"
 
 # Acceptable model file extensions PrusaSlicer can ingest headlessly
@@ -42,31 +41,25 @@ def _supabase() -> Client:
 
 # ---------- Utilities ----------
 def sh(cmd: str, cwd: Optional[str] = None, env: Optional[dict] = None) -> Tuple[int, str]:
-    """Run a shell command and capture combined stdout+stderr."""
     p = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, env=env)
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 def update_job(job_id: str, **fields):
-    """Best-effort DB update (never raise)."""
     try:
         _supabase().table("slice_jobs").update(fields).eq("id", job_id).execute()
     except Exception as e:
         print("DB update failed:", e)
 
 def signed_download(bucket: str, path: str, dest: str):
-    """Generate a signed URL and download to dest (handles full/partial URLs)."""
     if not SUPABASE_URL.startswith("https://"):
         raise RuntimeError(f"SUPABASE_URL is missing or invalid: {SUPABASE_URL!r}")
-
     res = _supabase().storage.from_(bucket).create_signed_url(path, 3600)
     signed = res.get("signedURL") or res.get("signed_url")
     if not signed:
         raise RuntimeError(f"create_signed_url returned no URL for {bucket}:{path} → {res}")
-
     url = signed if signed.startswith("http") else SUPABASE_URL.rstrip("/") + signed
     if not url.startswith("https://"):
         raise RuntimeError(f"Bad signed URL: {url}")
-
     print(f"Downloading model from: {url}")
     with urllib.request.urlopen(url) as r, open(dest, "wb") as f:
         f.write(r.read())
@@ -76,12 +69,9 @@ def upload_file(bucket: str, path: str, local_path: str, content_type: str):
         _supabase().storage.from_(bucket).upload(path, f, {"content-type": content_type, "upsert": True})
 
 def find_layers(base_dir: str) -> Optional[str]:
-    """Find the directory that actually contains PNG layer files."""
-    # Quick common paths
     for candidate in (os.path.join(base_dir, "slices"), os.path.join(base_dir, "sla")):
         if os.path.isdir(candidate) and glob.glob(os.path.join(candidate, "*.png")):
             return candidate
-    # Generic recursive: choose dir with the most PNGs
     best_dir, best_count = None, 0
     for root, _, files in os.walk(base_dir):
         count = sum(1 for f in files if f.lower().endswith(".png"))
@@ -97,43 +87,28 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 def _download_storage(object_path: str, dest: Path):
-    """Download a private object from Supabase Storage to dest."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     data = _supabase().storage.from_(STORAGE_BUCKET).download(object_path)
     dest.write_bytes(data)
 
 def resolve_preset(printer_id: str) -> Dict[str, Any]:
-    """
-    Fetch a printer preset row from DB, and ensure bundle/params are cached locally.
-    Table: public.printer_presets
-    """
     res = _supabase().table("printer_presets").select("*").eq("id", printer_id).single().execute()
     row = res.data
     if not row:
         raise HTTPException(status_code=400, detail=f"Unknown printer_id={printer_id}")
-
     bundle_cached = CACHE_DIR / row["bundle_path"].replace("/", "__")
     params_cached = CACHE_DIR / row["uvtools_params_path"].replace("/", "__")
-
     if not bundle_cached.exists():
         _download_storage(row["bundle_path"], bundle_cached)
     if not params_cached.exists():
         _download_storage(row["uvtools_params_path"], params_cached)
-
-    # Optional integrity check
     if row.get("bundle_sha256"):
         actual = _sha256(bundle_cached)
         if actual != row["bundle_sha256"]:
             raise HTTPException(status_code=400, detail=f"Bundle sha256 mismatch: expected {row['bundle_sha256']} got {actual}")
-
     return {"row": row, "bundle_local": str(bundle_cached), "params_local": str(params_cached)}
 
-# ---------- Bundle introspection helper ----------
 def list_bundle_presets(bundle_path: str) -> dict:
-    """
-    Parse a PrusaSlicer .ini bundle and return all available preset names
-    (printers, sla_prints, sla_materials). Used for error logs / debugging.
-    """
     try:
         text = Path(bundle_path).read_text(errors="ignore")
     except Exception:
@@ -144,7 +119,6 @@ def list_bundle_presets(bundle_path: str) -> dict:
     return {"printers": printers, "sla_prints": sla_prints, "sla_materials": sla_materials}
 
 def merge_overrides(params_path: Path, overrides: Optional[Dict[str, Any]]) -> Path:
-    """Allow-list merge of job overrides into UVtools params JSON."""
     params = json.loads(Path(params_path).read_text())
     for k, v in (overrides or {}).items():
         if k in ALLOWLIST_OVERRIDE_KEYS:
@@ -156,11 +130,9 @@ def merge_overrides(params_path: Path, overrides: Optional[Dict[str, Any]]) -> P
 # ---------- PrusaSlicer runner & datadir probing ----------
 def _base_env() -> dict:
     env = os.environ.copy()
-    # Helpful in containerized headless environments:
-    env.setdefault("NO_AT_BRIDGE", "1")            # avoid a11y D-Bus probing
-    env.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")   # mesa llvmpipe
-    env.setdefault("GDK_BACKEND", "x11")           # ensure X11, not wayland
-    # Give PrusaSlicer a writable HOME / XDG dirs:
+    env.setdefault("NO_AT_BRIDGE", "1")
+    env.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
+    env.setdefault("GDK_BACKEND", "x11")
     ps_home = env.get("PS_HOME", "/tmp/ps_home")
     os.makedirs(ps_home, exist_ok=True)
     env.setdefault("HOME", ps_home)
@@ -169,10 +141,6 @@ def _base_env() -> dict:
     return env
 
 def run_prusaslicer_headless(args: List[str]) -> Tuple[int, str, str]:
-    """
-    Run PrusaSlicer AppImage headlessly with xvfb-run.
-    Returns (rc, combined_output, rendered_command_str) for better error logs.
-    """
     env = _base_env()
     base = ["xvfb-run", "-a", "-s", "-screen 0 1024x768x24", PRUSA_APPIMAGE]
     cmd_list = base + args
@@ -180,68 +148,98 @@ def run_prusaslicer_headless(args: List[str]) -> Tuple[int, str, str]:
     rc, log = sh(cmd_str, env=env)
     return rc, log, cmd_str
 
+# --- NEW: robust datadir validation ---
+def _is_valid_datadir(p: str) -> bool:
+    """
+    Quick static checks to avoid bogus hits (like /usr/bin/resources).
+    We require the directory to contain at least two of these markers:
+      - profiles/   - vendor/   - shaders/   - icons/   - localization/
+    """
+    if not p or not os.path.isdir(p):
+        return False
+    bad_parts = ("/bin/", "/sbin/")
+    if any(bp in (p + "/") for bp in bad_parts):
+        return False
+    markers = 0
+    for name in ("profiles", "vendor", "shaders", "icons", "localization"):
+        if os.path.isdir(os.path.join(p, name)):
+            markers += 1
+    return markers >= 2
+
 def _probe_datadir_candidates() -> Tuple[Optional[str], List[str]]:
     """
-    Try reasonable datadir locations and pick the first that does NOT print
-    'Configuration wasn't found' on a simple command (e.g., --help).
-    Returns (chosen_datadir, tried_list)
+    Pick a datadir by:
+      1) trusting PRUSA_DATADIR if it exists and looks valid,
+      2) trying stable/common locations,
+      3) scanning under /opt/prusaslicer for likely resource roots,
+    then confirming with a --help banner check.
     """
     tried: List[str] = []
 
-    # 0) Respect explicit override
+    # 0) Respect explicit override if it passes static checks
     override = os.environ.get("PRUSA_DATADIR")
     if override:
         tried.append(override)
+        if _is_valid_datadir(override):
+            return override, tried
 
-    # 1) Start from where AppRun lives
+    # 1) Start from resolved AppRun
     try:
         resolved = Path(PRUSA_APPIMAGE).resolve()
     except Exception:
         resolved = Path(PRUSA_APPIMAGE)
     base = resolved.parent
 
-    # 2) Known relative locations from extracted AppImage
-    candidates: List[Path] = [
+    # 2) Preferred stable locations (Dockerfile created a symlink to this)
+    candidates: List[str] = []
+    for c in [
         base / "../share/prusa-slicer",
         base / "../share/PrusaSlicer",
         Path("/opt/prusaslicer/usr/share/prusa-slicer"),
         Path("/opt/prusaslicer/usr/share/PrusaSlicer"),
         Path("/opt/prusaslicer/share/prusa-slicer"),
         Path("/opt/prusaslicer/share/PrusaSlicer"),
-    ]
+        Path("/opt/prusaslicer/resources"),
+        Path("/opt/prusaslicer/Resources"),
+        Path("/opt/prusaslicer/usr/resources"),
+        Path("/opt/prusaslicer/usr/Resources"),
+        Path("/opt/prusaslicer/usr/lib/PrusaSlicer/resources"),
+        Path("/opt/prusaslicer/usr/lib64/PrusaSlicer/resources"),
+    ]:
+        cs = str(Path(c).resolve())
+        if cs not in candidates:
+            candidates.append(cs)
 
-    # 3) Recursively search under /opt/prusaslicer for */share/(prusa-slicer|PrusaSlicer)
+    # 3) Scan under /opt/prusaslicer up to depth 5 for dirs named like resources roots
     root = Path("/opt/prusaslicer")
     if root.exists():
-        # Limit depth to keep it cheap
         for p in root.rglob("*"):
             try:
-                if p.is_dir() and p.name in ("prusa-slicer", "PrusaSlicer") and p.parent.name == "share":
-                    candidates.append(p)
+                if not p.is_dir():
+                    continue
+                name = p.name
+                # ignore obviously wrong trees
+                pstr = str(p.resolve())
+                if "/bin/" in pstr or "/sbin/" in pstr:
+                    continue
+                if name in ("prusa-slicer", "PrusaSlicer", "resources", "Resources"):
+                    if pstr not in candidates:
+                        candidates.append(pstr)
             except Exception:
                 continue
 
-    # De-dup to strings
-    seen = set()
-    canon: List[str] = []
-    for c in candidates:
-        s = str(Path(c).resolve())
-        if s not in seen:
-            seen.add(s)
-            canon.append(s)
+    # 4) Evaluate candidates with static markers first
+    stat_ok = [p for p in candidates if _is_valid_datadir(p)]
+    tried.extend(candidates)
 
-    tried.extend(canon)
-
-    # Verify by running --help with each datadir
-    for c in canon:
-        if not os.path.isdir(c):
-            continue
+    # 5) Confirm with a light runtime check (banner, and no 'Configuration wasn't found')
+    for c in stat_ok:
         rc, log, _ = run_prusaslicer_headless(["--datadir", c, "--help"])
-        if rc == 0 and "PrusaSlicer" in (log or "") and "Configuration wasn't found" not in (log or ""):
+        if "PrusaSlicer" in (log or "") and "Configuration wasn't found" not in (log or ""):
             return c, tried
 
-    # Last resort: if override was set but verification failed, still return it so error shows it first
-    if override:
+    # If nothing passes runtime check, but override existed and stat-ok, use it anyway to aid debugging.
+    if override and _is_valid_datadir(override):
         return override, tried
 
     return None, tried
@@ -261,24 +259,18 @@ def ready():
         "has_WORKER_TOKEN": bool(WORKER_TOKEN),
         "storage_bucket": STORAGE_BUCKET,
         "datadir": chosen,
-        "datadir_tried": tried[:10],  # keep short
+        "datadir_tried": tried[:12],
     }
 
 # ---------- Main job endpoint ----------
 @app.post("/jobs")
 def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
-    """
-    Always return 200 with {"ok": True/False, "error": "..."}.
-    Write progress/errors to slice_jobs so the UI never sees opaque 500s.
-    """
     try:
-        # Env sanity
         if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
             return JSONResponse({"ok": False, "error": "missing_env SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY"}, status_code=200)
         if not WORKER_TOKEN:
             return JSONResponse({"ok": False, "error": "missing_env WORKER_TOKEN"}, status_code=200)
 
-        # Auth
         if authorization != f"Bearer {WORKER_TOKEN}":
             return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=200)
 
@@ -287,20 +279,16 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             return JSONResponse({"ok": False, "error": "missing job_id"}, status_code=200)
 
         s = _supabase()
-
-        # Fetch job
         job_q = s.table("slice_jobs").select("*").eq("id", job_id).single().execute()
         job = job_q.data
         if not job:
             return JSONResponse({"ok": False, "error": "job_not_found"}, status_code=200)
 
-        # Mark processing ASAP
         update_job(job_id, status="processing", error=None)
 
-        # Workspace
         wd = tempfile.mkdtemp(prefix=f"job_{job_id}_")
         try:
-            # 0) Resolve a valid PrusaSlicer datadir
+            # Resolve valid datadir
             datadir, tried = _probe_datadir_candidates()
             if not datadir:
                 update_job(
@@ -312,29 +300,24 @@ Tried datadirs: {tried}"""),
                 )
                 return {"ok": False, "error": "prusaslicer_datadir_not_found"}
 
-            # 1) Input model (spec is "bucket:path/in/bucket.ext")
+            # Input model
             in_spec = job["input_path"]
             if ":" not in in_spec:
                 update_job(job_id, status="failed", error=f"bad_input_path_format (expected 'bucket:path'): {in_spec}")
                 return {"ok": False, "error": "bad_input_path_format"}
             bucket, path_in_bucket = in_spec.split(":", 1)
 
-            # Preserve original filename & extension — PrusaSlicer relies on the extension
             base_name = os.path.basename(path_in_bucket.split("?")[0])
             _, ext = os.path.splitext(base_name)
             ext = ext.lower()
             if ext not in ALLOWED_MODEL_EXTS:
-                update_job(
-                    job_id,
-                    status="failed",
-                    error=f"unsupported_model_extension: {ext or '(none)'}; expected one of {sorted(ALLOWED_MODEL_EXTS)}; path was: {path_in_bucket}"
-                )
+                update_job(job_id, status="failed", error=f"unsupported_model_extension: {ext or '(none)'}; expected one of {sorted(ALLOWED_MODEL_EXTS)}; path was: {path_in_bucket}")
                 return {"ok": False, "error": "unsupported_model_extension"}
 
             input_model = os.path.join(wd, base_name)
             signed_download(bucket, path_in_bucket, input_model)
 
-            # 2) Resolve preset row (DB) and fetch bundle/params (Storage) to local cache
+            # Presets
             printer_id_raw = job.get("printer_id", "")
             if not printer_id_raw:
                 update_job(job_id, status="failed", error="missing printer_id")
@@ -351,14 +334,13 @@ Tried datadirs: {tried}"""),
             bundle_local = preset["bundle_local"]
             params_local = preset["params_local"]
 
-            # 2b) Preflight: ensure PrusaSlicer binary is runnable with this datadir
+            # Preflight
             rc0, log0, cmd0 = run_prusaslicer_headless(["--datadir", datadir, "--help"])
             if ("PrusaSlicer" not in (log0 or "")) and (rc0 != 0):
                 update_job(job_id, status="failed", error=f"prusaslicer_boot_failed rc={rc0}\nCMD: {cmd0}\n{(log0 or '')[-4000:]}")
                 return {"ok": False, "error": "prusaslicer_boot_failed"}
 
-            # 3) Slice with PrusaSlicer — attempt a few accepted flag combos
-            out_dir  = os.path.join(wd, "out")
+            out_dir = os.path.join(wd, "out")
             os.makedirs(out_dir, exist_ok=True)
 
             printer_name     = row["printer_profile_name"]
@@ -367,7 +349,6 @@ Tried datadirs: {tried}"""),
 
             attempts: List[List[str]] = []
 
-            # A) SLA export with explicit presets, --output (directory). PNG is default for SLA.
             attempts.append([
                 "--export-sla",
                 "--datadir", datadir,
@@ -380,7 +361,6 @@ Tried datadirs: {tried}"""),
                 input_model
             ])
 
-            # B) Explicit "slice" action (some headless paths prefer this). Keep all three profiles.
             attempts.append([
                 "--slice",
                 "--datadir", datadir,
@@ -393,13 +373,12 @@ Tried datadirs: {tried}"""),
                 input_model
             ])
 
-            # C) Export a project 3MF for debugging / artifact.
             project_out = os.path.join(out_dir, "project.3mf")
             attempts.append([
                 "--export-3mf",
                 "--datadir", datadir,
                 "--loglevel", "3",
-                "--output", project_out,  # single file path is correct for --export-3mf
+                "--output", project_out,
                 "--load", bundle_local,
                 "--printer-profile", printer_name,
                 "--print-profile", print_profile,
@@ -409,10 +388,9 @@ Tried datadirs: {tried}"""),
 
             success = False
             produced_project = False
-            attempt_logs = []
-            full_logs = []   # capture full logs for the report
+            attempt_logs: List[str] = []
+            full_logs: List[str] = []
 
-            # Record the PS banner for context
             v_rc, v_log, v_cmd = run_prusaslicer_headless(["--datadir", datadir, "--help"])
             ps_version = (v_log or "").strip().splitlines()[:3]
 
@@ -432,9 +410,7 @@ Tried datadirs: {tried}"""),
                 full_logs.append(f"Attempt {i} HEAD:\n{(log_try or '')[:1000]}\n")
 
             if not success:
-                # Introspect bundle to show available preset names (debug without terminal)
                 presets_available = list_bundle_presets(bundle_local)
-                # Also capture SLA help to include exact flags for this version
                 rc_help, log_help, cmd_help = run_prusaslicer_headless(["--datadir", datadir, "--help-sla"])
                 update_job(
                     job_id,
@@ -444,6 +420,7 @@ ps_version: {ps_version}
 printer_id: {printer_id}
 bundle: {row['bundle_path']}  params: {row['uvtools_params_path']}
 chosen_datadir: {datadir}
+
 presets_requested:
   printer={printer_name}
   print={print_profile}
@@ -467,19 +444,16 @@ presets_available:
 """))
                 return {"ok": False, "error": "prusaslicer_failed"}
 
-            # If we only produced a 3MF (attempt C), treat as partial success.
             if produced_project:
                 pass
 
-            # 3b) Find where PNG layers actually went (discover; don't assume path)
             slices_dir = find_layers(out_dir)
             if not slices_dir:
                 update_job(job_id, status="failed", error=f"no_slices_found in {out_dir}.\nCMD: {cmd1}\nPrusa log tail:\n{(log1 or '')[-4000:]}")
                 return {"ok": False, "error": "no_slices_found"}
 
-            # 4) Package with UVtools (pack PNG stack to native resin format)
             merged_params_path = merge_overrides(Path(params_local), job.get("overrides"))
-            native_format = row["native_format"]  # e.g., 'pwmx', 'ctb_v3', ...
+            native_format = row["native_format"]
             native_ext = native_format if native_format.startswith("ctb") or native_format.startswith("pwm") else native_format
             native_path = os.path.join(out_dir, f"print.{native_ext}")
 
@@ -496,29 +470,23 @@ presets_available:
                 update_job(job_id, status="failed", error=f"uvtools_failed rc={rc2}\n{(log2 or '')[-4000:]}")
                 return {"ok": False, "error": "uvtools_failed"}
 
-            # 5) Zip layers (for download/debug)
             zip_path = os.path.join(out_dir, "layers.zip")
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
                 for fn in sorted(glob.glob(os.path.join(slices_dir, "*.png"))):
                     z.write(fn, arcname=os.path.basename(fn))
 
-            # 6) Upload outputs
             job_prefix = str(job_id)
 
             def up(bucket_name: str, path: str, local: str, ctype: str):
                 with open(local, "rb") as f:
                     _supabase().storage.from_(bucket_name).upload(path, f, {"content-type": ctype, "upsert": True})
 
-            # Native
             up("native",   f"{job_prefix}/print.{native_ext}", native_path, "application/octet-stream")
-            # Optional project (.3mf) if PrusaSlicer happened to create one
             proj = next((f for f in os.listdir(out_dir) if f.endswith(".3mf")), None)
             if proj:
                 up("projects", f"{job_prefix}/{proj}", os.path.join(out_dir, proj), "model/3mf")
-            # Layers zip
             up("slices",   f"{job_prefix}/layers.zip", zip_path, "application/zip")
 
-            # 7) Finalize
             report = {"layers": len(glob.glob(os.path.join(slices_dir, "*.png")))}
             update_job(
                 job_id,
@@ -534,10 +502,8 @@ presets_available:
         except Exception as e:
             update_job(job_id, status="failed", error=f"{type(e).__name__}: {e}")
             return {"ok": False, "error": str(e)}
-
         finally:
             shutil.rmtree(wd, ignore_errors=True)
 
     except Exception as e:
-        # Never bubble 500s back to the function; record and return 200
         return JSONResponse({"ok": False, "error": f"fatal: {e}"}, status_code=200)
