@@ -25,6 +25,7 @@ ENV XDG_CACHE_HOME=${PS_HOME}/.cache
 #  - GTK/OpenGL + WebKitGTK 4.0: PrusaSlicer 2.8.x older-distros build
 #  - curl/wget/unzip: fetch release artifacts
 #  - python3/pip: run FastAPI worker
+#  - uvtools runtime deps: libgdiplus, libunwind8, libicu70, libfontconfig1
 # =========================
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget curl unzip ca-certificates \
@@ -32,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xvfb xauth \
     libgtk-3-0 libgl1 libglu1-mesa libxrender1 \
     libwebkit2gtk-4.0-37 \
+    libgdiplus libunwind8 libicu70 libfontconfig1 \
   && rm -rf /var/lib/apt/lists/*
 
 # Make sure our writable HOME exists
@@ -60,12 +62,36 @@ RUN PS_TMP=/tmp/ps_check && mkdir -p "$PS_TMP/.config" "$PS_TMP/.cache" \
 
 # =========================
 # UVtools CLI (prebuilt)
+#  - Download the Linux x64 zip
+#  - Expose as /usr/local/bin/uvtools-cli
+#  - Add compatibility symlink /usr/local/bin/uvtools → uvtools-cli
+#  - Build-time smoke test to catch path issues
 # =========================
-RUN wget -O /tmp/uvtools.zip \
-      https://github.com/sn4k3/UVtools/releases/download/v5.2.0/UVtools_linux-x64_v5.2.0.zip \
-  && unzip /tmp/uvtools.zip -d /opt/uvtools \
-  && ln -s /opt/uvtools/uvtools-cli /usr/local/bin/uvtools-cli \
-  && rm -f /tmp/uvtools.zip
+ARG UVTOOLS_VERSION=v5.2.0
+ARG UVTOOLS_ZIP_URL=https://github.com/sn4k3/UVtools/releases/download/${UVTOOLS_VERSION}/UVtools_linux-x64_${UVTOOLS_VERSION}.zip
+
+RUN set -eux; \
+    wget -O /tmp/uvtools.zip "${UVTOOLS_ZIP_URL}"; \
+    mkdir -p /opt/uvtools; \
+    unzip /tmp/uvtools.zip -d /opt/uvtools; \
+    rm -f /tmp/uvtools.zip; \
+    # Ensure the binary is executable regardless of its filename casing
+    chmod +x /opt/uvtools/UVtools || true; \
+    chmod +x /opt/uvtools/uvtools || true; \
+    # Create a stable CLI name on PATH
+    if [ -f /opt/uvtools/uvtools-cli ]; then \
+      ln -sf /opt/uvtools/uvtools-cli /usr/local/bin/uvtools-cli; \
+    elif [ -f /opt/uvtools/UVtools ]; then \
+      ln -sf /opt/uvtools/UVtools /usr/local/bin/uvtools-cli; \
+    elif [ -f /opt/uvtools/uvtools ]; then \
+      ln -sf /opt/uvtools/uvtools /usr/local/bin/uvtools-cli; \
+    else \
+      echo "UVtools binary not found after unzip" >&2; exit 1; \
+    fi; \
+    # Compatibility alias (some docs/tools call 'uvtools' directly)
+    ln -sf /usr/local/bin/uvtools-cli /usr/local/bin/uvtools; \
+    # Smoke test: ensure it runs and prints help/version without crashing
+    /usr/local/bin/uvtools-cli --help >/dev/null 2>&1 || /usr/local/bin/uvtools-cli -h >/dev/null 2>&1
 
 # =========================
 # Python deps & app
