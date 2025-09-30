@@ -23,7 +23,7 @@ ENV XDG_CACHE_HOME=${PS_HOME}/.cache
 ENV PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # .NET & globalization hardening for UVtools CLI (avoids rc=255 on some images)
-ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
+ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=0
 ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8
 
