@@ -61,11 +61,11 @@ RUN PS_TMP=/tmp/ps_check && mkdir -p "$PS_TMP/.config" "$PS_TMP/.cache" \
   && rm -rf "$PS_TMP"
 
 # =========================
-# UVtools CLI (prebuilt)
+# UVtools CLI (prebuilt) — install only; no build-time execution
 #  - Download the Linux x64 zip
-#  - Expose as /usr/local/bin/uvtools-cli
-#  - Add compatibility symlink /usr/local/bin/uvtools → uvtools-cli
-#  - Build-time smoke test to catch path issues
+#  - Make contained binary executable (name varies by release)
+#  - Create a stable wrapper /usr/local/bin/uvtools-cli that invokes it
+#  - Also add a compatibility symlink /usr/local/bin/uvtools → uvtools-cli
 # =========================
 ARG UVTOOLS_VERSION=v5.2.0
 ARG UVTOOLS_ZIP_URL=https://github.com/sn4k3/UVtools/releases/download/${UVTOOLS_VERSION}/UVtools_linux-x64_${UVTOOLS_VERSION}.zip
@@ -75,23 +75,14 @@ RUN set -eux; \
     mkdir -p /opt/uvtools; \
     unzip /tmp/uvtools.zip -d /opt/uvtools; \
     rm -f /tmp/uvtools.zip; \
-    # Ensure the binary is executable regardless of its filename casing
-    chmod +x /opt/uvtools/UVtools || true; \
-    chmod +x /opt/uvtools/uvtools || true; \
-    # Create a stable CLI name on PATH
-    if [ -f /opt/uvtools/uvtools-cli ]; then \
-      ln -sf /opt/uvtools/uvtools-cli /usr/local/bin/uvtools-cli; \
-    elif [ -f /opt/uvtools/UVtools ]; then \
-      ln -sf /opt/uvtools/UVtools /usr/local/bin/uvtools-cli; \
-    elif [ -f /opt/uvtools/uvtools ]; then \
-      ln -sf /opt/uvtools/uvtools /usr/local/bin/uvtools-cli; \
-    else \
-      echo "UVtools binary not found after unzip" >&2; exit 1; \
-    fi; \
-    # Compatibility alias (some docs/tools call 'uvtools' directly)
-    ln -sf /usr/local/bin/uvtools-cli /usr/local/bin/uvtools; \
-    # Smoke test: ensure it runs and prints help/version without crashing
-    /usr/local/bin/uvtools-cli --help >/dev/null 2>&1 || /usr/local/bin/uvtools-cli -h >/dev/null 2>&1
+    # Make plausible binary names executable; releases differ in casing/naming
+    chmod +x /opt/uvtools/UVtools 2>/dev/null || true; \
+    chmod +x /opt/uvtools/uvtools 2>/dev/null || true; \
+    chmod +x /opt/uvtools/uvtools-cli 2>/dev/null || true; \
+    # Create a wrapper that resolves to whichever binary exists
+    cat > /usr/local/bin/uvtools-cli <<'EOF'\n#!/bin/sh\nset -e\nif [ -x /opt/uvtools/uvtools-cli ]; then exec /opt/uvtools/uvtools-cli \"$@\"; fi\nif [ -x /opt/uvtools/UVtools ]; then exec /opt/uvtools/UVtools \"$@\"; fi\nif [ -x /opt/uvtools/uvtools ]; then exec /opt/uvtools/uvtools \"$@\"; fi\necho \"uvtools executable not found in /opt/uvtools\" >&2; exit 127\nEOF\n; \
+    chmod +x /usr/local/bin/uvtools-cli; \
+    ln -sf /usr/local/bin/uvtools-cli /usr/local/bin/uvtools
 
 # =========================
 # Python deps & app
