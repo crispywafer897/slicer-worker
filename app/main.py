@@ -254,7 +254,8 @@ def materialize_cli_config(bundle_path: str, printer_name: str, print_name: str,
     for kind, name in (("printer", printer_name), ("sla_print", print_name), ("sla_material", material_name)):
         section = _extract_section(txt, kind, name)
         if not section:
-            raise HTTPException(status_code=400, detail=f"Missing section [{kind}:{name}] in bundle}")
+            # fixed the stray '}' here
+            raise HTTPException(status_code=400, detail=f"Missing section [{kind}:{name}] in bundle")
         merged.update(section)
     merged.setdefault("printer_technology", "SLA")
     out = Path(dest_dir) / "merged_cli.ini"
