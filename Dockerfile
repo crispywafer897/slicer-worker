@@ -67,7 +67,7 @@ RUN PS_TMP=/tmp/ps_check && mkdir -p "$PS_TMP/.config" "$PS_TMP/.cache" \
 #  - Create a stable wrapper /usr/local/bin/uvtools-cli that invokes it
 #  - Also add a compatibility symlink /usr/local/bin/uvtools → uvtools-cli
 # =========================
-ARG UVTOOLS_VERSION=v5.2.0
+ARG UVTOOLS_VERSION=v5.2.1
 ARG UVTOOLS_ZIP_URL=https://github.com/sn4k3/UVtools/releases/download/${UVTOOLS_VERSION}/UVtools_linux-x64_${UVTOOLS_VERSION}.zip
 
 RUN set -eux; \
@@ -75,20 +75,18 @@ RUN set -eux; \
     mkdir -p /opt/uvtools; \
     unzip /tmp/uvtools.zip -d /opt/uvtools; \
     rm -f /tmp/uvtools.zip; \
-    # Make plausible binary names executable; releases differ in casing/naming
     chmod +x /opt/uvtools/UVtools 2>/dev/null || true; \
     chmod +x /opt/uvtools/uvtools 2>/dev/null || true; \
     chmod +x /opt/uvtools/uvtools-cli 2>/dev/null || true; \
-    # Create a wrapper that resolves to whichever binary exists
-    cat > /usr/local/bin/uvtools-cli << 'EOF'
-#!/bin/sh
-set -e
-if [ -x /opt/uvtools/uvtools-cli ]; then exec /opt/uvtools/uvtools-cli "$@"; fi
-if [ -x /opt/uvtools/UVtools ];     then exec /opt/uvtools/UVtools     "$@"; fi
-if [ -x /opt/uvtools/uvtools ];     then exec /opt/uvtools/uvtools     "$@"; fi
-echo "uvtools executable not found in /opt/uvtools" >&2
-exit 127
-EOF
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'set -e' \
+      'if [ -x /opt/uvtools/uvtools-cli ]; then exec /opt/uvtools/uvtools-cli "$@"; fi' \
+      'if [ -x /opt/uvtools/UVtools ];     then exec /opt/uvtools/UVtools     "$@"; fi' \
+      'if [ -x /opt/uvtools/uvtools ];     then exec /opt/uvtools/uvtools     "$@"; fi' \
+      'echo "uvtools executable not found in /opt/uvtools" >&2' \
+      'exit 127' \
+      > /usr/local/bin/uvtools-cli; \
     chmod +x /usr/local/bin/uvtools-cli; \
     ln -sf /usr/local/bin/uvtools-cli /usr/local/bin/uvtools
 
