@@ -263,45 +263,95 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 update_job(job_id, status="failed", error=f"prusaslicer_boot_failed rc={rc0}\nCMD: {cmd0}\n{log0[-4000:]}")
                 return {"ok": False, "error": "prusaslicer_boot_failed"}
 
-            # 3) Slice with PrusaSlicer (AppImage headless) — use --load bundle and exact preset names
+            # 3) Slice with PrusaSlicer — try a small matrix of accepted flag combos
             conf_dir = os.path.join(wd, "ps_config")
-            out_dir = os.path.join(wd, "out")
+            out_dir  = os.path.join(wd, "out")
             os.makedirs(conf_dir, exist_ok=True)
             os.makedirs(out_dir, exist_ok=True)
 
-            printer_name = row["printer_profile_name"]
-            print_profile = job.get("print_profile") or row["print_profile_name"]
+            printer_name     = row["printer_profile_name"]
+            print_profile    = job.get("print_profile")    or row["print_profile_name"]
             material_profile = job.get("material_profile") or row["material_profile_name"]
 
-            base_common = [
-    "--no-gui",
-    "--export-sla",
-    "--datadir", conf_dir,
-    "--loglevel", "3",
-    "--export-dir", out_dir,  # SLA exports expect a directory for image stack
-]
+            attempts = []
 
-
-            # Strict single attempt with --load + explicit names (preferred)
-            argv = base_common + [
+            # A) export-dir + explicit presets (current best practice)
+            attempts.append([
+                "--no-gui", "--export-sla",
+                "--datadir", conf_dir, "--loglevel", "3",
+                "--export-dir", out_dir,
                 "--load", bundle_local,
                 "--printer-profile", printer_name,
                 "--print-profile", print_profile,
                 "--material-profile", material_profile,
                 input_model
-            ]
+            ])
 
-            rc1, log1, cmd1 = run_prusaslicer_headless(argv)
-            if rc1 != 0:
-                # NEW: Introspect bundle to show available preset names for debugging (no terminal needed)
+            # B) output + explicit presets (some builds prefer --output even for SLA stacks)
+            attempts.append([
+                "--no-gui", "--export-sla",
+                "--datadir", conf_dir, "--loglevel", "3",
+                "--output", out_dir,
+                "--load", bundle_local,
+                "--printer-profile", printer_name,
+                "--print-profile", print_profile,
+                "--material-profile", material_profile,
+                input_model
+            ])
+
+            # C) export-dir + printer only (let defaults pick print/material)
+            attempts.append([
+                "--no-gui", "--export-sla",
+                "--datadir", conf_dir, "--loglevel", "3",
+                "--export-dir", out_dir,
+                "--load", bundle_local,
+                "--printer-profile", printer_name,
+                input_model
+            ])
+
+            # D) output + printer only
+            attempts.append([
+                "--no-gui", "--export-sla",
+                "--datadir", conf_dir, "--loglevel", "3",
+                "--output", out_dir,
+                "--load", bundle_local,
+                "--printer-profile", printer_name,
+                input_model
+            ])
+
+            # E) export-dir + explicit presets + explicit image format
+            attempts.append([
+                "--no-gui", "--export-sla",
+                "--datadir", conf_dir, "--loglevel", "3",
+                "--export-dir", out_dir,
+                "--load", bundle_local,
+                "--printer-profile", printer_name,
+                "--print-profile", print_profile,
+                "--material-profile", material_profile,
+                "--export-format", "png",
+                input_model
+            ])
+
+            success = False
+            attempt_logs = []
+            # Run attempts until one succeeds
+            for i, args in enumerate(attempts, start=1):
+                rc_try, log_try, cmd_try = run_prusaslicer_headless(args)
+                if rc_try == 0:
+                    success = True
+                    rc1, log1, cmd1 = rc_try, log_try, cmd_try
+                    break
+                attempt_logs.append(f"Attempt {i} rc={rc_try}\nCMD: {cmd_try}\nTAIL:\n{(log_try or '')[-1500:]}\n")
+
+            if not success:
+                # Introspect bundle to show available preset names (debug without terminal)
                 presets_available = list_bundle_presets(bundle_local)
-                # Capture SLA help to include exact flags for this version
+                # Also capture SLA help to include exact flags for this version
                 rc_help, log_help, cmd_help = run_prusaslicer_headless(["--help-sla"])
                 update_job(
                     job_id,
                     status="failed",
-                    error=textwrap.dedent(f"""prusaslicer_failed rc={rc1}
-CMD: {cmd1}
+                    error=textwrap.dedent(f"""prusaslicer_failed rc=1
 printer_id: {printer_id}
 bundle: {row['bundle_path']}  params: {row['uvtools_params_path']}
 presets_requested:
@@ -312,12 +362,12 @@ presets_available:
   printers={presets_available.get('printers')}
   sla_prints={presets_available.get('sla_prints')}
   sla_materials={presets_available.get('sla_materials')}
---- STDOUT/ERR (tail) ---
-{(log1 or '')[-4000:]}
+
+--- ATTEMPTS ---
+{chr(10).join(attempt_logs)}
 --help-sla (rc={rc_help}) tail:
 {(log_help or '')[-2000:]}
-""")
-                )
+"""))
                 return {"ok": False, "error": "prusaslicer_failed"}
 
             # 3b) Find where PNG layers actually went (discover; don't assume path)
@@ -327,13 +377,11 @@ presets_available:
                 return {"ok": False, "error": "no_slices_found"}
 
             # 4) Package with UVtools (pack PNG stack to native resin format)
-            # Merge overrides (safe keys only) into UVtools params
             merged_params_path = merge_overrides(Path(params_local), job.get("overrides"))
             native_format = row["native_format"]  # e.g., 'pwmx', 'ctb_v3', ...
             native_ext = native_format if native_format.startswith("ctb") or native_format.startswith("pwm") else native_format
             native_path = os.path.join(out_dir, f"print.{native_ext}")
 
-            # We avoid --printer-profile (we're packing from images with explicit params)
             cmd2_list = [
                 "uvtools-cli", "pack",
                 "--format", native_format,
