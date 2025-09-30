@@ -40,50 +40,45 @@ RUN wget -O /opt/PrusaSlicer.AppImage \
 
 # --------------------------------------------------------------------
 # Normalize + auto-detect PrusaSlicer datadir and expose a stable path.
-# We choose the *actual* resources root (prefer /opt/prusaslicer/resources),
+# Choose the *actual* resources root (prefer /opt/prusaslicer/resources),
 # verify hallmark subfolders, then create a stable alias at:
 #   /opt/prusaslicer/usr/share/prusa-slicer  →  <actual resources>
+# Also run a light runtime check to fail early if the datadir is wrong.
 # --------------------------------------------------------------------
 RUN set -eux; \
   ROOT="/opt/prusaslicer"; \
   mkdir -p "$ROOT/usr/share"; \
-  CANDIDATES="\
-    $ROOT/resources \
-    $ROOT/Resources \
-    $ROOT/usr/share/prusa-slicer \
-    $ROOT/usr/share/PrusaSlicer \
-    $ROOT/share/prusa-slicer \
-    $ROOT/share/PrusaSlicer \
-    $ROOT/usr/lib/PrusaSlicer/resources \
-    $ROOT/usr/lib64/PrusaSlicer/resources \
-  "; \
   DATADIR=""; \
-  for d in $CANDIDATES; do \
+  # Fast path: common locations (ordered by likelihood for this AppImage)
+  for d in \
+    "$ROOT/resources" \
+    "$ROOT/Resources" \
+    "$ROOT/usr/share/prusa-slicer" \
+    "$ROOT/usr/share/PrusaSlicer" \
+    "$ROOT/share/prusa-slicer" \
+    "$ROOT/share/PrusaSlicer" \
+    "$ROOT/usr/lib/PrusaSlicer/resources" \
+    "$ROOT/usr/lib64/PrusaSlicer/resources" \
+  ; do \
     if [ -d "$d" ]; then \
       markers=0; \
       [ -d "$d/profiles" ] && markers=$((markers+1)); \
       [ -d "$d/vendor" ]   && markers=$((markers+1)); \
       [ -d "$d/shaders" ]  && markers=$((markers+1)); \
-      if [ $markers -ge 2 ]; then \
-        DATADIR="$d"; \
-        echo "Chosen datadir (marker-validated): $d"; \
-        break; \
-      fi; \
+      if [ $markers -ge 2 ]; then DATADIR="$d"; echo "Chosen datadir (fast): $d"; break; fi; \
     fi; \
   done; \
+  # Slow path: scan under /opt/prusaslicer up to depth 5 for plausible dirs
   if [ -z "$DATADIR" ]; then \
     echo "Scanning for resources under $ROOT ..."; \
-    # Find a directory named resources/Resources/prusa-slicer/PrusaSlicer that contains at least 2 markers
-    while IFS= read -r d; do \
+    for d in $(find "$ROOT" -maxdepth 5 -type d \( -name resources -o -name Resources -o -name prusa-slicer -o -name PrusaSlicer \)); do \
       markers=0; \
       [ -d "$d/profiles" ] && markers=$((markers+1)); \
       [ -d "$d/vendor" ]   && markers=$((markers+1)); \
       [ -d "$d/shaders" ]  && markers=$((markers+1)); \
-      if [ $markers -ge 2 ]; then DATADIR="$d"; echo "Chosen datadir (scanned): $d"; break; fi; \
-    done <<EOF
-$(find "$ROOT" -maxdepth 5 -type d \( -name resources -o -name Resources -o -name prusa-slicer -o -name PrusaSlicer \))
-EOF \
-  ; fi; \
+      if [ $markers -ge 2 ]; then DATADIR="$d"; echo "Chosen datadir (scan): $d"; break; fi; \
+    done; \
+  fi; \
   if [ -z "$DATADIR" ]; then \
     echo "ERROR: Could not locate PrusaSlicer datadir under $ROOT"; \
     find "$ROOT" -maxdepth 4 -type d -print || true; \
@@ -92,7 +87,7 @@ EOF \
   ln -sfn "$DATADIR" "$ROOT/usr/share/prusa-slicer"; \
   echo "Stable alias → $ROOT/usr/share/prusa-slicer → $(readlink -f $ROOT/usr/share/prusa-slicer)"; \
   ls -la "$ROOT/usr/share"; \
-  # Light runtime check to ensure this datadir boots
+  # Light runtime check to ensure this datadir boots (no config error)
   xvfb-run -a -s '-screen 0 1024x768x24' /usr/local/bin/prusaslicer --datadir "$ROOT/usr/share/prusa-slicer" --help >/dev/null
 
 # Tell the app exactly where PrusaSlicer’s resources live (stable alias)
@@ -102,8 +97,7 @@ ENV PRUSA_DATADIR=/opt/prusaslicer/usr/share/prusa-slicer
 RUN test -d "${PRUSA_DATADIR}" || (ls -laR /opt/prusaslicer/usr/share && exit 1)
 
 # --------------------------------------------------------------------
-# UVtools CLI
-# - Using the official prebuilt zip. Symlink uvtools-cli into PATH.
+# UVtools CLI (prebuilt)
 # --------------------------------------------------------------------
 RUN wget -O /tmp/uvtools.zip \
       https://github.com/sn4k3/UVtools/releases/download/v5.2.0/UVtools_linux-x64_v5.2.0.zip \
