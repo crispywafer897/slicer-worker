@@ -98,8 +98,9 @@ def find_layers(base_dir: str) -> Optional[str]:
 
 def find_native_artifact(base_dir: str) -> Optional[str]:
     """
-    If PrusaSlicer exported a native resin file directly (e.g., .pwmx, .ctb, .sl1),
+    If PrusaSlicer exported a native resin file directly (e.g., .sl1 on SL1/SL1S),
     return the newest such file path; else None.
+    (Note: PrusaSlicer does not emit .ctb; those are UVtools-packed.)
     """
     candidates: List[str] = []
     for root, _, files in os.walk(base_dir):
@@ -121,6 +122,7 @@ def _sha256(path: Path) -> str:
 def _download_storage(object_path: str, dest: Path):
     dest.parent.mkdir(parents=True, exist_ok=True)
     data = _supabase().storage.from_(STORAGE_BUCKET).download(object_path)
+    # supabase-py returns bytes
     dest.write_bytes(data)
 
 def resolve_preset(printer_id: str) -> Dict[str, Any]:
@@ -158,6 +160,12 @@ def merge_overrides(params_path: Path, overrides: Optional[Dict[str, Any]]) -> P
     merged_path = Path(params_path).parent / (Path(params_path).stem + ".merged.json")
     merged_path.write_text(json.dumps(params))
     return merged_path
+
+def _read_json(path: Path) -> Dict[str, Any]:
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
 
 # ---------- User-config seeding for headless ----------
 def _config_root_from_env(env: dict) -> Path:
@@ -462,63 +470,77 @@ presets_available:
 """))
                 return {"ok": False, "error": "prusaslicer_failed"}
 
-            # --- Accept native artifacts directly if PrusaSlicer produced them ---
+            # --- Accept native artifacts directly IF AND ONLY IF they match this printer's native_format ---
+            # This prevents uploading .sl1 for printers that should be CTB (e.g., Saturn 4 Ultra).
             native_found = find_native_artifact(out_dir)
             if native_found:
-                try:
-                    time.sleep(0.02)
-                except Exception:
-                    pass
-                # Also zip layers if PNGs exist (optional)
-                slices_dir_opt = find_layers(out_dir)
-                zip_path = None
-                if slices_dir_opt:
-                    zip_path = os.path.join(out_dir, "layers.zip")
-                    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
-                        for fn in sorted(glob.glob(os.path.join(slices_dir_opt, "*.png"))):
-                            z.write(fn, arcname=os.path.basename(fn))
+                found_ext = Path(native_found).suffix.lstrip(".").lower()
+                expected_native = str(row.get("native_format", "")).lower()
+                if found_ext == expected_native:
+                    try:
+                        time.sleep(0.02)
+                    except Exception:
+                        pass
+                    # Also zip layers if PNGs exist (optional)
+                    slices_dir_opt = find_layers(out_dir)
+                    zip_path = None
+                    if slices_dir_opt:
+                        zip_path = os.path.join(out_dir, "layers.zip")
+                        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+                            for fn in sorted(glob.glob(os.path.join(slices_dir_opt, "*.png"))):
+                                z.write(fn, arcname=os.path.basename(fn))
 
-                native_ext = Path(native_found).suffix.lstrip(".")
-                job_prefix = str(job_id)
+                    native_ext = found_ext
+                    job_prefix = str(job_id)
 
-                print(f"Uploading native artifact: bucket=native path={job_prefix}/print.{native_ext}")
-                upload_file("native", f"{job_prefix}/print.{native_ext}", native_found, "application/octet-stream")
-                proj = next((f for f in os.listdir(out_dir) if f.endswith(".3mf")), None)
-                if proj:
-                    upload_file("projects", f"{job_prefix}/{proj}", os.path.join(out_dir, proj), "model/3mf")
-                if zip_path:
-                    upload_file("slices", f"{job_prefix}/layers.zip", zip_path, "application/zip")
+                    print(f"Uploading native artifact: bucket=native path={job_prefix}/print.{native_ext}")
+                    upload_file("native", f"{job_prefix}/print.{native_ext}", native_found, "application/octet-stream")
+                    proj = next((f for f in os.listdir(out_dir) if f.endswith(".3mf")), None)
+                    if proj:
+                        upload_file("projects", f"{job_prefix}/{proj}", os.path.join(out_dir, proj), "model/3mf")
+                    if zip_path:
+                        upload_file("slices", f"{job_prefix}/layers.zip", zip_path, "application/zip")
 
-                report = {
-                    "native_ext": native_ext,
-                    "native_source": "prusaslicer",
-                    "layers": len(glob.glob(os.path.join(slices_dir_opt, "*.png"))) if slices_dir_opt else 0
-                }
-                update_job(
-                    job_id,
-                    status="succeeded",
-                    report=report,
-                    output_native_path=f"native:{job_prefix}/print.{native_ext}",
-                    output_project_path=(f"projects:{job_prefix}/{proj}" if proj else None),
-                    output_slices_zip_path=(f"slices:{job_prefix}/layers.zip" if zip_path else None),
-                    error=None,
-                )
-                return {"ok": True}
+                    report = {
+                        "native_ext": native_ext,
+                        "native_source": "prusaslicer",
+                        "layers": len(glob.glob(os.path.join(slices_dir_opt, "*.png"))) if slices_dir_opt else 0
+                    }
+                    update_job(
+                        job_id,
+                        status="succeeded",
+                        report=report,
+                        output_native_path=f"native:{job_prefix}/print.{native_ext}",
+                        output_project_path=(f"projects:{job_prefix}/{proj}" if proj else None),
+                        output_slices_zip_path=(f"slices:{job_prefix}/layers.zip" if zip_path else None),
+                        error=None,
+                    )
+                    return {"ok": True}
+                else:
+                    # Found a native file but it's not the expected format for this printer; ignore and pack with UVtools.
+                    print(f"Ignoring PS-native artifact ext=.{found_ext} (expected .{expected_native}); will pack with UVtools.")
 
-            # --- Original path: rely on PNG slices + UVtools pack ---
+            # --- PNG slices + UVtools pack path ---
             slices_dir = find_layers(out_dir)
             if not slices_dir:
                 update_job(job_id, status="failed", error=f"no_slices_found in {out_dir}.\nCMD: {cmd1}\nPrusa log tail:\n{(log1 or '')[-4000:]}")
                 return {"ok": False, "error": "no_slices_found"}
 
             merged_params_path = merge_overrides(Path(params_local), job.get("overrides"))
-            native_format = row["native_format"]
-            native_ext = native_format if native_format.startswith("ctb") or native_format.startswith("pwm") else native_format
+
+            # Determine target format: prefer params['target_format'], else preset row's native_format
+            params_obj = _read_json(Path(merged_params_path))
+            target_format = str(params_obj.get("target_format") or row.get("native_format") or "").lower().strip()
+            if not target_format:
+                update_job(job_id, status="failed", error="uvtools_target_format_missing (no 'target_format' in params and no 'native_format' in preset)")
+                return {"ok": False, "error": "uvtools_target_format_missing"}
+
+            native_ext = target_format  # extension mirrors format (e.g., "ctb", "sl1")
             native_path = os.path.join(out_dir, f"print.{native_ext}")
 
             cmd2_list = [
                 "uvtools-cli", "pack",
-                "--format", native_format,
+                "--format", target_format,
                 "--params", str(merged_params_path),
                 "--slices", slices_dir,
                 "--out", native_path
