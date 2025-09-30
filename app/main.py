@@ -274,12 +274,13 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             material_profile = job.get("material_profile") or row["material_profile_name"]
 
             base_common = [
-                "--no-gui",
-                "--export-sla",
-                "--datadir", conf_dir,
-                "--loglevel", "3",
-                "--output", out_dir,  # let find_layers() discover final PNG dir
-            ]
+    "--no-gui",
+    "--export-sla",
+    "--datadir", conf_dir,
+    "--loglevel", "3",
+    "--export-dir", out_dir,  # SLA exports expect a directory for image stack
+]
+
 
             # Strict single attempt with --load + explicit names (preferred)
             argv = base_common + [
