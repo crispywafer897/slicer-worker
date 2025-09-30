@@ -1,4 +1,4 @@
-import os, subprocess, shutil, json, tempfile, zipfile, urllib.request, glob, shlex, hashlib, textwrap
+import os, subprocess, shutil, json, tempfile, zipfile, urllib.request, glob, shlex, hashlib, textwrap, re
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
@@ -126,6 +126,21 @@ def resolve_preset(printer_id: str) -> Dict[str, Any]:
             raise HTTPException(status_code=400, detail=f"Bundle sha256 mismatch: expected {row['bundle_sha256']} got {actual}")
 
     return {"row": row, "bundle_local": str(bundle_cached), "params_local": str(params_cached)}
+
+# ---------- NEW: Bundle introspection helper ----------
+def list_bundle_presets(bundle_path: str) -> dict:
+    """
+    Parse a PrusaSlicer .ini bundle and return all available preset names
+    (printers, sla_prints, sla_materials). Used for error logs / debugging.
+    """
+    try:
+        text = Path(bundle_path).read_text(errors="ignore")
+    except Exception:
+        return {"printers": [], "sla_prints": [], "sla_materials": []}
+    printers = re.findall(r'^\[printer:([^\]]+)\]', text, flags=re.M)
+    sla_prints = re.findall(r'^\[sla_print:([^\]]+)\]', text, flags=re.M)
+    sla_materials = re.findall(r'^\[sla_material:([^\]]+)\]', text, flags=re.M)
+    return {"printers": printers, "sla_prints": sla_prints, "sla_materials": sla_materials}
 
 def merge_overrides(params_path: Path, overrides: Optional[Dict[str, Any]]) -> Path:
     """Allow-list merge of job overrides into UVtools params JSON."""
@@ -277,6 +292,8 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
 
             rc1, log1, cmd1 = run_prusaslicer_headless(argv)
             if rc1 != 0:
+                # NEW: Introspect bundle to show available preset names for debugging (no terminal needed)
+                presets_available = list_bundle_presets(bundle_local)
                 # Capture SLA help to include exact flags for this version
                 rc_help, log_help, cmd_help = run_prusaslicer_headless(["--help-sla"])
                 update_job(
@@ -286,10 +303,14 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
 CMD: {cmd1}
 printer_id: {printer_id}
 bundle: {row['bundle_path']}  params: {row['uvtools_params_path']}
-presets:
+presets_requested:
   printer={printer_name}
   print={print_profile}
   material={material_profile}
+presets_available:
+  printers={presets_available.get('printers')}
+  sla_prints={presets_available.get('sla_prints')}
+  sla_materials={presets_available.get('sla_materials')}
 --- STDOUT/ERR (tail) ---
 {(log1 or '')[-4000:]}
 --help-sla (rc={rc_help}) tail:
