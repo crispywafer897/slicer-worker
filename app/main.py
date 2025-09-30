@@ -172,7 +172,7 @@ def _has_uvtools() -> bool:
 
 def _unpack_sl1_to_pngs(native_path: str, out_dir: str) -> Optional[str]:
     """
-    Minimal fallback: .sl1/.sl1s are ZIP archives. Extract PNGs if UVtools is not present.
+    Minimal fallback: .sl1/.sl1s are ZIP archives. Extract PNGs if UVtools is not present or failed.
     Returns the directory containing PNGs, or None if none found.
     """
     try:
@@ -180,7 +180,6 @@ def _unpack_sl1_to_pngs(native_path: str, out_dir: str) -> Optional[str]:
             z.extractall(out_dir)
     except Exception:
         return None
-    # heuristics: look for any dir with PNGs
     return find_layers(out_dir)
 
 # ---------- User-config seeding for headless ----------
@@ -232,7 +231,7 @@ def _resolve_datadir_opt_in() -> Optional[str]:
 def _maybe_with_datadir(args: List[str], datadir: Optional[str]) -> List[str]:
     return (["--datadir", datadir] if datadir else []) + args
 
-# ---------- Bundle flattening ----------
+# ---------- Bundle flattening (build a one-file CLI config) ----------
 def _extract_section(text: str, kind: str, name: str) -> Dict[str, str]:
     pat = re.compile(rf"^\[{re.escape(kind)}:{re.escape(name)}\]\s*([\s\S]*?)(?=^\[|\Z)", re.M)
     m = pat.search(text)
@@ -255,7 +254,7 @@ def materialize_cli_config(bundle_path: str, printer_name: str, print_name: str,
     for kind, name in (("printer", printer_name), ("sla_print", print_name), ("sla_material", material_name)):
         section = _extract_section(txt, kind, name)
         if not section:
-            raise HTTPException(status_code=400, detail=f"Missing section [{kind}:{name}] in bundle")
+            raise HTTPException(status_code=400, detail=f"Missing section [{kind}:{name}] in bundle}")
         merged.update(section)
     merged.setdefault("printer_technology", "SLA")
     out = Path(dest_dir) / "merged_cli.ini"
@@ -306,6 +305,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
 
         wd = tempfile.mkdtemp(prefix=f"job_{job_id}_")
         try:
+            # Datadir (optional)
             datadir = _resolve_datadir_opt_in()
             if os.environ.get("PS_FORCE_DATADIR") and not datadir:
                 update_job(job_id, status="failed",
@@ -355,7 +355,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             out_dir = os.path.join(wd, "out")
             os.makedirs(out_dir, exist_ok=True)
 
-            # Flatten profiles
+            # Flatten profiles into a one-file CLI config
             printer_name     = row["printer_profile_name"]
             print_profile    = job.get("print_profile")    or row["print_profile_name"]
             material_profile = job.get("material_profile") or row["material_profile_name"]
@@ -397,7 +397,10 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             if not success:
                 presets_available = list_bundle_presets(bundle_local)
                 rc_help, log_help, cmd_help = run_prusaslicer_headless(_maybe_with_datadir(["--help-sla"], datadir))
-                update_job(job_id, status="failed", error=textwrap.dedent(f"""prusaslicer_failed rc=1
+                update_job(
+                    job_id,
+                    status="failed",
+                    error=textwrap.dedent(f"""prusaslicer_failed rc=1
 ps_version: {ps_version}
 printer_id: {printer_id}
 bundle: {row['bundle_path']}  params: {row['uvtools_params_path']}
@@ -461,32 +464,32 @@ presets_available:
                                error=None)
                     return {"ok": True}
 
-                # Otherwise: wrong native (e.g., .sl1) → try to unpack to PNGs
+                # Wrong native (e.g., .sl1) → try to unpack → pack to target format
                 print(f"Found PS-native ext=.{found_ext} but expected .{expected_native}. Attempting unpack.")
                 unpack_dir = os.path.join(out_dir, "unpacked_slices")
                 os.makedirs(unpack_dir, exist_ok=True)
 
                 slices_dir = None
+                log_u = ""
                 if _has_uvtools():
-                    rc_u, log_u = sh(" ".join(["uvtools-cli","unpack","--out", shlex.quote(unpack_dir), shlex.quote(native_found)]))
+                    cmd_u = " ".join(["uvtools-cli", "unpack", "--out", shlex.quote(unpack_dir), shlex.quote(native_found)])
+                    rc_u, log_u = sh(cmd_u)
                     if rc_u == 0:
                         slices_dir = find_layers(unpack_dir)
                     else:
-                        update_job(job_id, status="failed", error=f"uvtools_unpack_failed rc={rc_u}\n{(log_u or '')[-4000:]}")
-                        return {"ok": False, "error": "uvtools_unpack_failed"}
-                else:
-                    # Fallback for .sl1/.sl1s without UVtools
-                    if found_ext in ("sl1","sl1s"):
-                        slices_dir = _unpack_sl1_to_pngs(native_found, unpack_dir)
-                        if not slices_dir:
-                            update_job(job_id, status="failed", error="unpack_sl1_failed (no PNGs found after zip extract)")
-                            return {"ok": False, "error": "unpack_sl1_failed"}
-                    else:
-                        update_job(job_id, status="failed",
-                                   error="uvtools_missing: UVtools not installed and native format requires UVtools to unpack.")
-                        return {"ok": False, "error": "uvtools_missing"}
+                        print(f"uvtools unpack failed rc={rc_u}; will try ZIP fallback for .sl1/.sl1s")
 
-                # With slices_dir ready, proceed to pack (requires UVtools)
+                if not slices_dir and found_ext in ("sl1", "sl1s"):
+                    slices_dir = _unpack_sl1_to_pngs(native_found, unpack_dir)
+
+                if not slices_dir:
+                    detail = f"no_slices_found_after_unpack in {unpack_dir}"
+                    if log_u:
+                        detail += f"\nuvtools_unpack_log_tail:\n{(log_u or '')[-2000:]}"
+                    update_job(job_id, status="failed", error=detail)
+                    return {"ok": False, "error": "no_slices_found_after_unpack"}
+
+                # Merge overrides & target format
                 merged_params_path = merge_overrides(Path(params_local), job.get("overrides"))
                 params_obj = _read_json(Path(merged_params_path))
                 target_format = str(params_obj.get("target_format") or row.get("native_format") or "").lower().strip()
@@ -494,16 +497,20 @@ presets_available:
                     update_job(job_id, status="failed", error="uvtools_target_format_missing (no 'target_format' in params and no 'native_format' in preset)")
                     return {"ok": False, "error": "uvtools_target_format_missing"}
 
-                if not _has_uvtools() and target_format not in ("sl1","sl1s"):
+                if not _has_uvtools() and target_format not in ("sl1", "sl1s"):
                     update_job(job_id, status="failed",
                                error="uvtools_missing: packing to non-SL1 format (e.g., CTB) requires uvtools-cli in the container.")
                     return {"ok": False, "error": "uvtools_missing"}
 
                 native_ext = target_format
                 native_path = os.path.join(out_dir, f"print.{native_ext}")
-                cmd2_list = ["uvtools-cli","pack","--format",target_format,"--params",str(merged_params_path),"--slices",slices_dir,"--out",native_path]
-                cmd2 = " ".join(shlex.quote(str(x)) for x in cmd2_list)
-                rc2, log2 = sh(cmd2) if _has_uvtools() else (127, "uvtools-cli not found")
+                if _has_uvtools():
+                    cmd2_list = ["uvtools-cli","pack","--format",target_format,"--params",str(merged_params_path),"--slices",slices_dir,"--out",native_path]
+                    cmd2 = " ".join(shlex.quote(str(x)) for x in cmd2_list)
+                    rc2, log2 = sh(cmd2)
+                else:
+                    rc2, log2 = (127, "uvtools-cli not found")
+
                 if rc2 != 0:
                     update_job(job_id, status="failed", error=f"uvtools_failed rc={rc2}\n{(log2 or '')[-4000:]}")
                     return {"ok": False, "error": "uvtools_failed"}
@@ -543,16 +550,20 @@ presets_available:
                 update_job(job_id, status="failed", error="uvtools_target_format_missing (no 'target_format' in params and no 'native_format' in preset)")
                 return {"ok": False, "error": "uvtools_target_format_missing"}
 
-            if not _has_uvtools() and target_format not in ("sl1","sl1s"):
+            if not _has_uvtools() and target_format not in ("sl1", "sl1s"):
                 update_job(job_id, status="failed",
                            error="uvtools_missing: packing to non-SL1 format (e.g., CTB) requires uvtools-cli in the container.")
                 return {"ok": False, "error": "uvtools_missing"}
 
             native_ext = target_format
             native_path = os.path.join(out_dir, f"print.{native_ext}")
-            cmd2_list = ["uvtools-cli","pack","--format",target_format,"--params",str(merged_params_path),"--slices",slices_dir,"--out",native_path]
-            cmd2 = " ".join(shlex.quote(str(x)) for x in cmd2_list)
-            rc2, log2 = sh(cmd2) if _has_uvtools() else (127, "uvtools-cli not found")
+            if _has_uvtools():
+                cmd2_list = ["uvtools-cli","pack","--format",target_format,"--params",str(merged_params_path),"--slices",slices_dir,"--out",native_path]
+                cmd2 = " ".join(shlex.quote(str(x)) for x in cmd2_list)
+                rc2, log2 = sh(cmd2)
+            else:
+                rc2, log2 = (127, "uvtools-cli not found")
+
             if rc2 != 0:
                 update_job(job_id, status="failed", error=f"uvtools_failed rc={rc2}\n{(log2 or '')[-4000:]}")
                 return {"ok": False, "error": "uvtools_failed"}
