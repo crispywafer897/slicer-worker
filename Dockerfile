@@ -47,4 +47,61 @@ RUN mkdir -p "${XDG_CONFIG_HOME}" "${XDG_CACHE_HOME}" "${CACHE_DIR}" && chmod -R
 # PrusaSlicer AppImage
 # =========================
 RUN wget -O /opt/PrusaSlicer.AppImage \
-      https://github.com/prusa3d/PrusaSlicer/releases/download/version_2.8.1/PrusaSlicer-2.8.1+linux-x64-older_
+      https://github.com/prusa3d/PrusaSlicer/releases/download/version_2.8.1/PrusaSlicer-2.8.1+linux-x64-older-distros-GTK3-202409181354.AppImage \
+  && chmod +x /opt/PrusaSlicer.AppImage \
+  && /opt/PrusaSlicer.AppImage --appimage-extract \
+  && mv squashfs-root /opt/prusaslicer \
+  && ln -sf /opt/prusaslicer/AppRun /usr/local/bin/prusaslicer \
+  && rm -f /opt/PrusaSlicer.AppImage
+
+# Optional: tiny smoke test that does NOT fixate a datadir.
+RUN PS_TMP=/tmp/ps_check && mkdir -p "$PS_TMP/.config" "$PS_TMP/.cache" \
+  && env HOME="$PS_TMP" XDG_CONFIG_HOME="$PS_TMP/.config" XDG_CACHE_HOME="$PS_TMP/.cache" \
+     xvfb-run -a -s '-screen 0 1024x768x24' prusaslicer --help-sla >/dev/null \
+  && rm -rf "$PS_TMP"
+
+# =========================
+# UVtools CLI (install-only)
+# =========================
+ARG UVTOOLS_VERSION=v5.2.1
+ARG UVTOOLS_ZIP_URL=https://github.com/sn4k3/UVtools/releases/download/v5.2.1/UVtools_linux-x64_v5.2.1.zip
+
+RUN set -eux; \
+    wget -O /tmp/uvtools.zip "${UVTOOLS_ZIP_URL}"; \
+    mkdir -p /opt/uvtools; \
+    unzip /tmp/uvtools.zip -d /opt/uvtools; \
+    rm -f /tmp/uvtools.zip; \
+    # Make any of the shipped candidates executable (names vary by release)
+    chmod +x /opt/uvtools/UVtools 2>/dev/null || true; \
+    chmod +x /opt/uvtools/uvtools 2>/dev/null || true; \
+    chmod +x /opt/uvtools/uvtools-cli 2>/dev/null || true; \
+    # Create a stable wrapper on PATH
+    printf '%s\n' \
+      '#!/bin/sh' \
+      'set -e' \
+      'for CAND in /opt/uvtools/uvtools-cli /opt/uvtools/UVtools /opt/uvtools/uvtools; do' \
+      '  if [ -x "$CAND" ]; then exec "$CAND" "$@"; fi' \
+      'done' \
+      'echo "uvtools executable not found in /opt/uvtools" >&2' \
+      'exit 127' \
+      > /usr/local/bin/uvtools-cli; \
+    chmod +x /usr/local/bin/uvtools-cli; \
+    ln -sf /usr/local/bin/uvtools-cli /usr/local/bin/uvtools
+
+# =========================
+# Python deps & app
+# =========================
+WORKDIR /app
+COPY requirements.txt ./requirements.txt
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+# Copy only application code (presets are fetched at runtime)
+COPY app ./app
+
+# Cloud Run port
+ENV PORT=8080
+
+# =========================
+# Start API (FastAPI service invokes PrusaSlicer via xvfb-run)
+# =========================
+CMD ["python3", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
