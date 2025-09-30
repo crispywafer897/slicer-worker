@@ -127,7 +127,7 @@ def resolve_preset(printer_id: str) -> Dict[str, Any]:
 
     return {"row": row, "bundle_local": str(bundle_cached), "params_local": str(params_cached)}
 
-# ---------- NEW: Bundle introspection helper ----------
+# ---------- Bundle introspection helper ----------
 def list_bundle_presets(bundle_path: str) -> dict:
     """
     Parse a PrusaSlicer .ini bundle and return all available preset names
@@ -159,7 +159,10 @@ def run_prusaslicer_headless(args: list[str]) -> tuple[int, str, str]:
     Returns (rc, combined_output, rendered_command_str) for better error logs.
     """
     env = os.environ.copy()
-    env.setdefault("NO_AT_BRIDGE", "1")  # avoid a11y D-Bus probing
+    # Helpful in containerized headless environments:
+    env.setdefault("NO_AT_BRIDGE", "1")           # avoid a11y D-Bus probing
+    env.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")  # mesa llvmpipe
+    env.setdefault("GDK_BACKEND", "x11")          # ensure X11, not wayland
 
     base = ["xvfb-run", "-a", "-s", "-screen 0 1024x768x24", PRUSA_APPIMAGE]
     cmd_list = base + args
@@ -258,12 +261,13 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             params_local = preset["params_local"]
 
             # 2b) Preflight: ensure PrusaSlicer binary is runnable
-            rc0, log0, cmd0 = run_prusaslicer_headless(["--version"])
-            if ("PrusaSlicer" not in log0) and (rc0 != 0):
-                update_job(job_id, status="failed", error=f"prusaslicer_boot_failed rc={rc0}\nCMD: {cmd0}\n{log0[-4000:]}")
+            # NOTE: 2.8.1 does not support --version; parse first lines of --help instead.
+            rc0, log0, cmd0 = run_prusaslicer_headless(["--help"])
+            if ("PrusaSlicer" not in (log0 or "")) and (rc0 != 0):
+                update_job(job_id, status="failed", error=f"prusaslicer_boot_failed rc={rc0}\nCMD: {cmd0}\n{(log0 or '')[-4000:]}")
                 return {"ok": False, "error": "prusaslicer_boot_failed"}
 
-                       # 3) Slice with PrusaSlicer — try a small matrix of accepted flag combos
+            # 3) Slice with PrusaSlicer — try a small matrix of accepted flag combos
             conf_dir = os.path.join(wd, "ps_config")
             out_dir  = os.path.join(wd, "out")
             os.makedirs(conf_dir, exist_ok=True)
@@ -273,23 +277,11 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             print_profile    = job.get("print_profile")    or row["print_profile_name"]
             material_profile = job.get("material_profile") or row["material_profile_name"]
 
-            attempts = []
+            attempts: list[list[str]] = []
 
-            # A) export-dir + explicit presets (current best practice)
+            # A) SLA export with explicit presets, prefer --output (directory)
             attempts.append([
-                "--no-gui", "--export-sla",
-                "--datadir", conf_dir, "--loglevel", "3",
-                "--export-dir", out_dir,
-                "--load", bundle_local,
-                "--printer-profile", printer_name,
-                "--print-profile", print_profile,
-                "--material-profile", material_profile,
-                input_model
-            ])
-
-            # B) output + explicit presets (some builds prefer --output even for SLA stacks)
-            attempts.append([
-                "--no-gui", "--export-sla",
+                "--export-sla",
                 "--datadir", conf_dir, "--loglevel", "3",
                 "--output", out_dir,
                 "--load", bundle_local,
@@ -299,19 +291,22 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 input_model
             ])
 
-            # C) export-dir + printer only (let defaults pick print/material)
+            # B) Same but explicit format
             attempts.append([
-                "--no-gui", "--export-sla",
+                "--export-sla",
                 "--datadir", conf_dir, "--loglevel", "3",
-                "--export-dir", out_dir,
+                "--output", out_dir,
                 "--load", bundle_local,
                 "--printer-profile", printer_name,
+                "--print-profile", print_profile,
+                "--material-profile", material_profile,
+                "--export-format", "png",
                 input_model
             ])
 
-            # D) output + printer only
+            # C) SLA export with printer only (let bundle defaults pick print/material)
             attempts.append([
-                "--no-gui", "--export-sla",
+                "--export-sla",
                 "--datadir", conf_dir, "--loglevel", "3",
                 "--output", out_dir,
                 "--load", bundle_local,
@@ -319,11 +314,11 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 input_model
             ])
 
-            # E) export-dir + explicit presets + explicit image format
+            # D) Explicit "slice" action to force batch slicing paths
             attempts.append([
-                "--no-gui", "--export-sla",
+                "--slice",
                 "--datadir", conf_dir, "--loglevel", "3",
-                "--export-dir", out_dir,
+                "--output", out_dir,
                 "--load", bundle_local,
                 "--printer-profile", printer_name,
                 "--print-profile", print_profile,
@@ -332,23 +327,10 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 input_model
             ])
 
-            # F) Explicit "do the slicing" action (some builds need --slice for batch)
-            attempts.append([
-                "--no-gui", "--slice",
-                "--datadir", conf_dir, "--loglevel", "3",
-                "--export-dir", out_dir,
-                "--load", bundle_local,
-                "--printer-profile", printer_name,
-                "--print-profile", print_profile,
-                "--material-profile", material_profile,
-                "--export-format", "png",
-                input_model
-            ])
-
-            # G) Export just a project 3MF; if this works, presets resolved and actions work
+            # E) Export a project 3MF for debugging / artifact
             project_out = os.path.join(out_dir, "project.3mf")
             attempts.append([
-                "--no-gui", "--export-3mf",
+                "--export-3mf",
                 "--datadir", conf_dir, "--loglevel", "3",
                 "--output", project_out,     # single file path is correct for --export-3mf
                 "--load", bundle_local,
@@ -363,21 +345,22 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             attempt_logs = []
             full_logs = []   # capture full logs for first few attempts
 
-            # Record the PS version for context
-            v_rc, v_log, v_cmd = run_prusaslicer_headless(["--version"])
+            # Record the PS version-ish header for context
+            v_rc, v_log, v_cmd = run_prusaslicer_headless(["--help"])
             ps_version = (v_log or "").strip().splitlines()[:3]
 
+            cmd1, log1 = "", ""
             for i, args in enumerate(attempts, start=1):
                 rc_try, log_try, cmd_try = run_prusaslicer_headless(args)
-                # Success if rc==0 OR (attempt G produced a 3MF file)
+                # Success if rc==0 OR (final attempt exported a 3MF)
                 if rc_try == 0:
                     success = True
-                    rc1, log1, cmd1 = rc_try, log_try, cmd_try
+                    cmd1, log1 = cmd_try, log_try
                     break
                 if i == len(attempts) and os.path.exists(project_out):
                     success = True
                     produced_project = True
-                    rc1, log1, cmd1 = rc_try, log_try, cmd_try
+                    cmd1, log1 = cmd_try, log_try
                     break
                 # keep a short tail per attempt for the error report (but store head too for clues)
                 attempt_logs.append(f"Attempt {i} rc={rc_try}\nCMD: {cmd_try}\nTAIL:\n{(log_try or '')[-1500:]}\n")
@@ -418,11 +401,9 @@ presets_available:
 """))
                 return {"ok": False, "error": "prusaslicer_failed"}
 
-            # If we only produced a 3MF (attempt G), treat as partial success.
-            # We'll still try to find layers; if none exist, we upload the 3MF so you can inspect it.
+            # If we only produced a 3MF (attempt E), treat as partial success.
             if produced_project:
-                # If slicing didn't emit PNG layers, you can choose to skip UVtools and mark a different status.
-                # We'll continue with the normal flow; find_layers() may return None here and trigger a helpful error.
+                # We'll proceed to find layers; if none, we still upload the 3MF for inspection.
                 pass
 
             # 3b) Find where PNG layers actually went (discover; don't assume path)
@@ -440,7 +421,7 @@ presets_available:
             cmd2_list = [
                 "uvtools-cli", "pack",
                 "--format", native_format,
-                "--params", merged_params_path,
+                "--params", str(merged_params_path),
                 "--slices", slices_dir,
                 "--out", native_path
             ]
