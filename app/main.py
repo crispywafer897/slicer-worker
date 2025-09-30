@@ -72,9 +72,17 @@ def signed_download(bucket: str, path: str, dest: str):
     with urllib.request.urlopen(url) as r, open(dest, "wb") as f:
         f.write(r.read())
 
-def upload_file(bucket: str, path: str, local_path: str, content_type: str):
-    with open(local_path, "rb") as f:
-        _supabase().storage.from_(bucket).upload(path, f, {"content-type": content_type, "upsert": True})
+def upload_file(bucket: str, path: str, local_path: str, content_type: str, upsert: bool = True):
+    """
+    Upload to Supabase Storage using bytes and string options to avoid bool->encode errors.
+    """
+    data = Path(local_path).read_bytes()
+    file_options = {
+        "contentType": content_type,     # supabase-py accepts 'contentType'
+        "upsert": "true" if upsert else "false",
+        "cacheControl": "3600",
+    }
+    _supabase().storage.from_(bucket).upload(path, data, file_options)
 
 def find_layers(base_dir: str) -> Optional[str]:
     # common PrusaSlicer SLA outputs
@@ -371,7 +379,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 update_job(job_id, status="failed", error=f"bundle_section_missing: {he.detail}")
                 return {"ok": False, "error": "bundle_section_missing"}
 
-            # Attempts (we keep your three-stage strategy)
+            # Attempts (keep three-stage strategy)
             attempts: List[List[str]] = []
             attempts.append(_maybe_with_datadir([
                 "--export-sla",
@@ -454,15 +462,14 @@ presets_available:
 """))
                 return {"ok": False, "error": "prusaslicer_failed"}
 
-            # --- New: accept native artifacts directly if PrusaSlicer produced them ---
+            # --- Accept native artifacts directly if PrusaSlicer produced them ---
             native_found = find_native_artifact(out_dir)
             if native_found:
-                # Optional: sanity delay in case filesystem timestamps race
                 try:
                     time.sleep(0.02)
                 except Exception:
                     pass
-                # Try to zip layers if PNGs also exist; otherwise skip quietly
+                # Also zip layers if PNGs exist (optional)
                 slices_dir_opt = find_layers(out_dir)
                 zip_path = None
                 if slices_dir_opt:
@@ -474,16 +481,13 @@ presets_available:
                 native_ext = Path(native_found).suffix.lstrip(".")
                 job_prefix = str(job_id)
 
-                def up(bucket_name: str, path: str, local: str, ctype: str):
-                    with open(local, "rb") as f:
-                        _supabase().storage.from_(bucket_name).upload(path, f, {"content-type": ctype, "upsert": True})
-
-                up("native",   f"{job_prefix}/print.{native_ext}", native_found, "application/octet-stream")
+                print(f"Uploading native artifact: bucket=native path={job_prefix}/print.{native_ext}")
+                upload_file("native", f"{job_prefix}/print.{native_ext}", native_found, "application/octet-stream")
                 proj = next((f for f in os.listdir(out_dir) if f.endswith(".3mf")), None)
                 if proj:
-                    up("projects", f"{job_prefix}/{proj}", os.path.join(out_dir, proj), "model/3mf")
+                    upload_file("projects", f"{job_prefix}/{proj}", os.path.join(out_dir, proj), "model/3mf")
                 if zip_path:
-                    up("slices",   f"{job_prefix}/layers.zip", zip_path, "application/zip")
+                    upload_file("slices", f"{job_prefix}/layers.zip", zip_path, "application/zip")
 
                 report = {
                     "native_ext": native_ext,
@@ -532,15 +536,12 @@ presets_available:
 
             job_prefix = str(job_id)
 
-            def up(bucket_name: str, path: str, local: str, ctype: str):
-                with open(local, "rb") as f:
-                    _supabase().storage.from_(bucket_name).upload(path, f, {"content-type": ctype, "upsert": True})
-
-            up("native",   f"{job_prefix}/print.{native_ext}", native_path, "application/octet-stream")
+            print(f"Uploading UVtools native artifact: bucket=native path={job_prefix}/print.{native_ext}")
+            upload_file("native",   f"{job_prefix}/print.{native_ext}", native_path, "application/octet-stream")
             proj = next((f for f in os.listdir(out_dir) if f.endswith(".3mf")), None)
             if proj:
-                up("projects", f"{job_prefix}/{proj}", os.path.join(out_dir, proj), "model/3mf")
-            up("slices",   f"{job_prefix}/layers.zip", zip_path, "application/zip")
+                upload_file("projects", f"{job_prefix}/{proj}", os.path.join(out_dir, proj), "model/3mf")
+            upload_file("slices",   f"{job_prefix}/layers.zip", zip_path, "application/zip")
 
             report = {
                 "native_ext": native_ext,
