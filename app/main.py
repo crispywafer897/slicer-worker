@@ -471,12 +471,11 @@ presets_available:
                 return {"ok": False, "error": "prusaslicer_failed"}
 
             # --- Accept native artifacts directly IF AND ONLY IF they match this printer's native_format ---
-            # This prevents uploading .sl1 for printers that should be CTB (e.g., Saturn 4 Ultra).
             native_found = find_native_artifact(out_dir)
             if native_found:
                 found_ext = Path(native_found).suffix.lstrip(".").lower()
                 expected_native = str(row.get("native_format", "")).lower()
-                if found_ext == expected_native:
+                if found_ext == expected_native and found_ext:
                     try:
                         time.sleep(0.02)
                     except Exception:
@@ -517,10 +516,86 @@ presets_available:
                     )
                     return {"ok": True}
                 else:
-                    # Found a native file but it's not the expected format for this printer; ignore and pack with UVtools.
-                    print(f"Ignoring PS-native artifact ext=.{found_ext} (expected .{expected_native}); will pack with UVtools.")
+                    # Found a native file but it's not the expected format for this printer; convert path:
+                    # 1) Unpack native (e.g., .sl1) to PNGs, then 2) UVtools-pack to target (e.g., CTB).
+                    print(f"Found PS-native ext=.{found_ext} but expected .{expected_native}; attempting UVtools unpack → pack.")
+                    unpack_dir = os.path.join(out_dir, "unpacked_slices")
+                    os.makedirs(unpack_dir, exist_ok=True)
+                    # Try UVtools unpack
+                    # uvtools-cli unpack --out <unpack_dir> <native_found>
+                    rc_u, log_u = sh(" ".join([
+                        "uvtools-cli", "unpack",
+                        "--out", shlex.quote(unpack_dir),
+                        shlex.quote(native_found)
+                    ]))
+                    if rc_u != 0:
+                        update_job(job_id, status="failed",
+                                   error=f"uvtools_unpack_failed rc={rc_u}\n{(log_u or '')[-4000:]}")
+                        return {"ok": False, "error": "uvtools_unpack_failed"}
+                    # After unpack, continue as if slices_dir was found
+                    slices_dir = find_layers(unpack_dir)
+                    if not slices_dir:
+                        update_job(job_id, status="failed",
+                                   error=f"no_slices_found_after_unpack in {unpack_dir}\n{(log_u or '')[-2000:]}")
+                        return {"ok": False, "error": "no_slices_found_after_unpack"}
+                    # Fall through to the standard UVtools pack path below using these slices
 
-            # --- PNG slices + UVtools pack path ---
+                    # Merge overrides and determine target format from params/preset
+                    merged_params_path = merge_overrides(Path(params_local), job.get("overrides"))
+                    params_obj = _read_json(Path(merged_params_path))
+                    target_format = str(params_obj.get("target_format") or row.get("native_format") or "").lower().strip()
+                    if not target_format:
+                        update_job(job_id, status="failed", error="uvtools_target_format_missing (no 'target_format' in params and no 'native_format' in preset)")
+                        return {"ok": False, "error": "uvtools_target_format_missing"}
+
+                    native_ext = target_format
+                    native_path = os.path.join(out_dir, f"print.{native_ext}")
+
+                    cmd2_list = [
+                        "uvtools-cli", "pack",
+                        "--format", target_format,
+                        "--params", str(merged_params_path),
+                        "--slices", slices_dir,
+                        "--out", native_path
+                    ]
+                    cmd2 = " ".join(shlex.quote(str(x)) for x in cmd2_list)
+                    rc2, log2 = sh(cmd2)
+                    if rc2 != 0:
+                        update_job(job_id, status="failed", error=f"uvtools_failed rc={rc2}\n{(log2 or '')[-4000:]}")
+                        return {"ok": False, "error": "uvtools_failed"}
+
+                    # Zip the unpacked layers for optional artifact
+                    zip_path = os.path.join(out_dir, "layers.zip")
+                    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+                        for fn in sorted(glob.glob(os.path.join(slices_dir, "*.png"))):
+                            z.write(fn, arcname=os.path.basename(fn))
+
+                    job_prefix = str(job_id)
+
+                    print(f"Uploading UVtools native artifact: bucket=native path={job_prefix}/print.{native_ext}")
+                    upload_file("native",   f"{job_prefix}/print.{native_ext}", native_path, "application/octet-stream")
+                    proj = next((f for f in os.listdir(out_dir) if f.endswith(".3mf")), None)
+                    if proj:
+                        upload_file("projects", f"{job_prefix}/{proj}", os.path.join(out_dir, proj), "model/3mf")
+                    upload_file("slices",   f"{job_prefix}/layers.zip", zip_path, "application/zip")
+
+                    report = {
+                        "native_ext": native_ext,
+                        "native_source": "uvtools",
+                        "layers": len(glob.glob(os.path.join(slices_dir, "*.png")))
+                    }
+                    update_job(
+                        job_id,
+                        status="succeeded",
+                        report=report,
+                        output_native_path=f"native:{job_prefix}/print.{native_ext}",
+                        output_project_path=(f"projects:{job_prefix}/{proj}" if proj else None),
+                        output_slices_zip_path=f"slices:{job_prefix}/layers.zip",
+                        error=None,
+                    )
+                    return {"ok": True}
+
+            # --- PNG slices + UVtools pack path (standard) ---
             slices_dir = find_layers(out_dir)
             if not slices_dir:
                 update_job(job_id, status="failed", error=f"no_slices_found in {out_dir}.\nCMD: {cmd1}\nPrusa log tail:\n{(log1 or '')[-4000:]}")
@@ -541,10 +616,13 @@ presets_available:
             cmd2_list = [
                 "uvtools-cli", "pack",
                 "--format", target_format,
-                "--params", str(merged_params_path),
+                "--params", str(Merged_params_path if False else merged_params_path),  # keep variable case consistent
                 "--slices", slices_dir,
                 "--out", native_path
             ]
+            # fix variable casing
+            cmd2_list[5] = str(merged_params_path)
+
             cmd2 = " ".join(shlex.quote(str(x)) for x in cmd2_list)
             rc2, log2 = sh(cmd2)
             if rc2 != 0:
