@@ -263,7 +263,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 update_job(job_id, status="failed", error=f"prusaslicer_boot_failed rc={rc0}\nCMD: {cmd0}\n{log0[-4000:]}")
                 return {"ok": False, "error": "prusaslicer_boot_failed"}
 
-            # 3) Slice with PrusaSlicer — try a small matrix of accepted flag combos
+                       # 3) Slice with PrusaSlicer — try a small matrix of accepted flag combos
             conf_dir = os.path.join(wd, "ps_config")
             out_dir  = os.path.join(wd, "out")
             os.makedirs(conf_dir, exist_ok=True)
@@ -332,16 +332,56 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 input_model
             ])
 
+            # F) Explicit "do the slicing" action (some builds need --slice for batch)
+            attempts.append([
+                "--no-gui", "--slice",
+                "--datadir", conf_dir, "--loglevel", "3",
+                "--export-dir", out_dir,
+                "--load", bundle_local,
+                "--printer-profile", printer_name,
+                "--print-profile", print_profile,
+                "--material-profile", material_profile,
+                "--export-format", "png",
+                input_model
+            ])
+
+            # G) Export just a project 3MF; if this works, presets resolved and actions work
+            project_out = os.path.join(out_dir, "project.3mf")
+            attempts.append([
+                "--no-gui", "--export-3mf",
+                "--datadir", conf_dir, "--loglevel", "3",
+                "--output", project_out,     # single file path is correct for --export-3mf
+                "--load", bundle_local,
+                "--printer-profile", printer_name,
+                "--print-profile", print_profile,
+                "--material-profile", material_profile,
+                input_model
+            ])
+
             success = False
+            produced_project = False
             attempt_logs = []
-            # Run attempts until one succeeds
+            full_logs = []   # capture full logs for first few attempts
+
+            # Record the PS version for context
+            v_rc, v_log, v_cmd = run_prusaslicer_headless(["--version"])
+            ps_version = (v_log or "").strip().splitlines()[:3]
+
             for i, args in enumerate(attempts, start=1):
                 rc_try, log_try, cmd_try = run_prusaslicer_headless(args)
+                # Success if rc==0 OR (attempt G produced a 3MF file)
                 if rc_try == 0:
                     success = True
                     rc1, log1, cmd1 = rc_try, log_try, cmd_try
                     break
+                if i == len(attempts) and os.path.exists(project_out):
+                    success = True
+                    produced_project = True
+                    rc1, log1, cmd1 = rc_try, log_try, cmd_try
+                    break
+                # keep a short tail per attempt for the error report (but store head too for clues)
                 attempt_logs.append(f"Attempt {i} rc={rc_try}\nCMD: {cmd_try}\nTAIL:\n{(log_try or '')[-1500:]}\n")
+                full_logs.append(f"Attempt {i} HEAD:\n{(log_try or '')[:1000]}\n")
 
             if not success:
                 # Introspect bundle to show available preset names (debug without terminal)
@@ -352,6 +392,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                     job_id,
                     status="failed",
                     error=textwrap.dedent(f"""prusaslicer_failed rc=1
+ps_version: {ps_version}
 printer_id: {printer_id}
 bundle: {row['bundle_path']}  params: {row['uvtools_params_path']}
 presets_requested:
@@ -363,12 +404,26 @@ presets_available:
   sla_prints={presets_available.get('sla_prints')}
   sla_materials={presets_available.get('sla_materials')}
 
---- ATTEMPTS ---
+--- ATTEMPTS (TAILS) ---
 {chr(10).join(attempt_logs)}
+
+--- ATTEMPTS (HEADS) ---
+{chr(10).join(full_logs)}
+
+--help-sla (rc={rc_help}) head:
+{(log_help or '')[:1200]}
+
 --help-sla (rc={rc_help}) tail:
-{(log_help or '')[-2000:]}
+{(log_help or '')[-1200:]}
 """))
                 return {"ok": False, "error": "prusaslicer_failed"}
+
+            # If we only produced a 3MF (attempt G), treat as partial success.
+            # We'll still try to find layers; if none exist, we upload the 3MF so you can inspect it.
+            if produced_project:
+                # If slicing didn't emit PNG layers, you can choose to skip UVtools and mark a different status.
+                # We'll continue with the normal flow; find_layers() may return None here and trigger a helpful error.
+                pass
 
             # 3b) Find where PNG layers actually went (discover; don't assume path)
             slices_dir = find_layers(out_dir)
