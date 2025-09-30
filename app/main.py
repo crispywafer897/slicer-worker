@@ -586,12 +586,13 @@ presets_available:
 
                 if _has_uvtools():
                     cmd2_list = [
-                        "uvtools-cli","pack",
-                        "--format", target_format,
-                        "--params", str(merged_params_path),
-                        "--slices", slices_dir,
-                        "--out",    native_path
-                    ]
+    "uvtools-cli","pack",
+    "--loglevel","debug",
+    "--format", target_format,
+    "--params", str(merged_params_path),
+    "--slices", slices_dir,
+    "--out",    native_path
+]
                     cmd2 = " ".join(shlex.quote(str(x)) for x in cmd2_list)
                     rc2, log2 = sh(cmd2)
                 else:
@@ -664,7 +665,14 @@ presets_available:
                 return {"ok": False, "error": "uvtools_params_invalid"}
 
             if _has_uvtools():
-                cmd2_list = ["uvtools-cli","pack","--format",target_format,"--params",str(merged_params_path),"--slices",slices_dir,"--out",native_path]
+                cmd2_list = [
+    "uvtools-cli","pack",
+    "--loglevel","debug",
+    "--format", target_format,
+    "--params", str(merged_params_path),
+    "--slices", slices_dir,
+    "--out",    native_path
+]
                 cmd2 = " ".join(shlex.quote(str(x)) for x in cmd2_list)
                 rc2, log2 = sh(cmd2)
             else:
