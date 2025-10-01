@@ -263,22 +263,46 @@ def _create_sl1_from_pngs(slices_dir: str, params_obj: Dict[str, Any], output_pa
                 return False
             for i, png_file in enumerate(png_files):
                 zf.write(png_file, f"{i:05d}.png")
+            
+            # Create prusaslicer.ini (required by UVtools)
+            layer_height = params_obj.get('layer_height_mm', 0.05)
+            bottom_layers = params_obj.get('bottom_layers', 5)
+            normal_exp = params_obj.get('normal_exposure_s', 2.5)
+            bottom_exp = params_obj.get('bottom_exposure_s', 20.0)
+            
+            prusaslicer_ini = f"""expTime = {normal_exp}
+expTimeFirst = {bottom_exp}
+fileCreationTimestamp = 2024-01-01 at 12:00:00 UTC
+jobDir = job1
+layerHeight = {layer_height}
+materialName = Generic
+numFade = 0
+numFast = {len(png_files) - bottom_layers}
+numSlow = {bottom_layers}
+printTime = 0
+printerModel = SL1
+printerVariant = default
+printProfile = default
+"""
+            zf.writestr("prusaslicer.ini", prusaslicer_ini)
+            
+            # Also create config.ini for compatibility
             config_ini = f"""[general]
 fileVersion = 1
-jobDir = .
-layerHeight = {params_obj.get('layer_height_mm', 0.05)}
-initialLayerCount = {params_obj.get('bottom_layers', 5)}
+jobDir = job1
+layerHeight = {layer_height}
+initialLayerCount = {bottom_layers}
 printTime = 0
 materialName = Generic
-printerModel = Generic SLA
+printerModel = SL1
 printerVariant = default
 printProfile = default
 materialProfile = default
 numFade = 0
-numSlow = 0
-numFast = {len(png_files)}
-expTime = {params_obj.get('normal_exposure_s', 2.5)}
-expTimeFirst = {params_obj.get('bottom_exposure_s', 20.0)}
+numSlow = {bottom_layers}
+numFast = {len(png_files) - bottom_layers}
+expTime = {normal_exp}
+expTimeFirst = {bottom_exp}
 """
             zf.writestr("config.ini", config_ini)
         return True
