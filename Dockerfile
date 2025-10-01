@@ -63,31 +63,37 @@ RUN PS_TMP=/tmp/ps_check && mkdir -p "$PS_TMP/.config" "$PS_TMP/.cache" \
 # =========================
 # UVtools CLI (install-only)
 # =========================
-ARG UVTOOLS_VERSION=v5.2.1
-ARG UVTOOLS_ZIP_URL=https://github.com/sn4k3/UVtools/releases/download/v5.2.1/UVtools_linux-x64_v5.2.1.zip
+ARG UVTOOLS_VERSION=v4.4.2
+ARG UVTOOLS_ZIP_URL=https://github.com/sn4k3/UVtools/releases/download/v4.4.2/UVtools_linux-x64_v4.4.2.zip
 
 RUN set -eux; \
     wget -O /tmp/uvtools.zip "${UVTOOLS_ZIP_URL}"; \
     mkdir -p /opt/uvtools; \
     unzip /tmp/uvtools.zip -d /opt/uvtools; \
     rm -f /tmp/uvtools.zip; \
-    # Make any of the shipped candidates executable (names vary by release)
-    chmod +x /opt/uvtools/UVtools 2>/dev/null || true; \
-    chmod +x /opt/uvtools/uvtools 2>/dev/null || true; \
-    chmod +x /opt/uvtools/uvtools-cli 2>/dev/null || true; \
-    # Create a stable wrapper on PATH
+    # Find and make executable
+    find /opt/uvtools -type f -name "UVtools*" -o -name "uvtools*" | xargs chmod +x 2>/dev/null || true; \
+    # List what we actually got
+    ls -la /opt/uvtools/; \
+    # Create wrapper that tries all possible names
     printf '%s\n' \
-      '#!/bin/sh' \
+      '#!/bin/bash' \
       'set -e' \
-      'for CAND in /opt/uvtools/uvtools-cli /opt/uvtools/UVtools /opt/uvtools/uvtools; do' \
-      '  if [ -x "$CAND" ]; then exec "$CAND" "$@"; fi' \
+      'FOUND=""' \
+      'for CAND in /opt/uvtools/UVtools.CLI /opt/uvtools/UVtools /opt/uvtools/uvtools-cli /opt/uvtools/uvtools; do' \
+      '  if [ -x "$CAND" ]; then FOUND="$CAND"; break; fi' \
       'done' \
-      'echo "uvtools executable not found in /opt/uvtools" >&2' \
-      'exit 127' \
+      'if [ -z "$FOUND" ]; then' \
+      '  echo "ERROR: No executable UVtools binary found in /opt/uvtools" >&2' \
+      '  echo "Contents:" >&2' \
+      '  ls -la /opt/uvtools/ >&2' \
+      '  exit 127' \
+      'fi' \
+      'exec "$FOUND" "$@"' \
       > /usr/local/bin/uvtools-cli; \
     chmod +x /usr/local/bin/uvtools-cli; \
     ln -sf /usr/local/bin/uvtools-cli /usr/local/bin/uvtools
-
+    
 # =========================
 # Python deps & app
 # =========================
