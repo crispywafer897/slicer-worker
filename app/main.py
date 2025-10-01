@@ -525,10 +525,10 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             ]
 
             attempts: List[List[str]] = []
-            # Try with explicit output to a file (forces directory creation)
-            output_file_base = os.path.join(out_dir, input_basename)
-            attempts.append(_maybe_with_datadir(["--export-sla","--loglevel","3","--output",output_file_base,"--load",str(merged_cli_ini),input_model], datadir))
-            attempts.append(_maybe_with_datadir(["--slice","--loglevel","3","--output",output_file_base,"--load",str(merged_cli_ini),input_model], datadir))
+            # Use the out_dir directly - let PrusaSlicer manage subdirectories
+            # The key is to NOT specify a basename without extension, as that creates a file
+            attempts.append(_maybe_with_datadir(["--export-sla","--loglevel","3","--output",out_dir + "/","--load",str(merged_cli_ini),input_model], datadir))
+            attempts.append(_maybe_with_datadir(["--slice","--loglevel","3","--output",out_dir + "/","--load",str(merged_cli_ini),input_model], datadir))
             project_out = os.path.join(out_dir, "project.3mf")
             attempts.append(_maybe_with_datadir(["--export-3mf","--loglevel","3","--output",project_out,"--load",str(merged_cli_ini),input_model], datadir))
             
