@@ -75,23 +75,25 @@ RUN set -eux; \
     chmod +x /opt/uvtools/UVtools.CLI 2>/dev/null || true; \
     echo "=== UVtools contents ===" && ls -lah /opt/uvtools/ && echo "======================="
 
-# Create wrapper that uses dotnet to run UVtools
+# Create wrapper that uses the CLI tool (UVtoolsCmd)
 RUN printf '%s\n' \
       '#!/bin/bash' \
       'set -e' \
       'UVTOOLS_DIR="/opt/uvtools"' \
-      '# UVtools might be a .dll that needs dotnet to run' \
+      '# Try the CLI DLL first (most reliable)' \
+      'if [ -f "$UVTOOLS_DIR/UVtoolsCmd.dll" ]; then' \
+      '  exec dotnet "$UVTOOLS_DIR/UVtoolsCmd.dll" "$@"' \
+      'fi' \
+      '# Fall back to CLI executable' \
+      'if [ -x "$UVTOOLS_DIR/UVtoolsCmd" ]; then' \
+      '  exec "$UVTOOLS_DIR/UVtoolsCmd" "$@"' \
+      'fi' \
+      '# Last resort: try UVtools.dll' \
       'if [ -f "$UVTOOLS_DIR/UVtools.dll" ]; then' \
       '  exec dotnet "$UVTOOLS_DIR/UVtools.dll" "$@"' \
       'fi' \
-      '# Or it might be a standalone executable' \
-      'for exe in "$UVTOOLS_DIR/UVtools" "$UVTOOLS_DIR/UVtools.CLI" "$UVTOOLS_DIR/uvtools"; do' \
-      '  if [ -x "$exe" ]; then' \
-      '    exec "$exe" "$@"' \
-      '  fi' \
-      'done' \
-      'echo "ERROR: Could not find UVtools executable or DLL" >&2' \
-      'ls -la "$UVTOOLS_DIR" >&2' \
+      'echo "ERROR: Could not find UVtoolsCmd.dll or executable" >&2' \
+      'ls -la "$UVTOOLS_DIR" | grep -i uvtools >&2' \
       'exit 127' \
       > /usr/local/bin/uvtools-cli && \
     chmod +x /usr/local/bin/uvtools-cli && \
