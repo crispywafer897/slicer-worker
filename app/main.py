@@ -642,8 +642,9 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             merged_params_path = merge_overrides(Path(params_local), job.get("overrides"))
             params_obj = _read_json(Path(merged_params_path))
             target_format = str(params_obj.get("target_format") or row.get("native_format") or "").lower().strip()
-            fmt_alias = {"ctb": params_obj.get("ctb_variant", "ctb")}
-            target_format = fmt_alias.get(target_format, target_format)
+            # Normalize CTB variants to just "ctb" for UVtools compatibility
+            if target_format in ("ctb7", "ctb2", "gktwo.ctb"):
+                target_format = "ctb"
             if not target_format:
                 update_job(job_id, status="failed", error="uvtools_target_format_missing")
                 return {"ok": False, "error": "uvtools_target_format_missing"}
