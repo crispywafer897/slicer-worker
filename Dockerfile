@@ -5,30 +5,24 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
-# Prevent GTK from probing the accessibility D-Bus (keeps headless runs clean)
 ENV NO_AT_BRIDGE=1
 
-# Where the worker expects to fetch bundles/params at runtime
 ENV STORAGE_BUCKET=slicer-presets
-# Where we cache bundles/params inside the container between requests
 ENV CACHE_DIR=/tmp/preset_cache
 
-# A dedicated, writable HOME for headless PrusaSlicer/User config
 ENV PS_HOME=/tmp/pshome
 ENV HOME=${PS_HOME}
 ENV XDG_CONFIG_HOME=${PS_HOME}/.config
 ENV XDG_CACHE_HOME=${PS_HOME}/.cache
 
-# Ensure /usr/local/bin precedes others so our UVtools wrapper is found by PATH checks
 ENV PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
 
-# .NET & globalization hardening for UVtools CLI (avoids rc=255 on some images)
 ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=0
 ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8
 
 # =========================
-# System deps
+# System deps + .NET Runtime
 # =========================
 RUN apt-get update && apt-get install -y --no-install-recommends \
     wget curl unzip ca-certificates \
@@ -40,7 +34,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libx11-6 libx11-xcb1 libxcb1 \
   && rm -rf /var/lib/apt/lists/*
 
-# Make sure our writable HOME exists
+# Install .NET 8 Runtime (required for UVtools)
+RUN wget https://dot.net/v1/dotnet-install.sh -O /tmp/dotnet-install.sh \
+  && chmod +x /tmp/dotnet-install.sh \
+  && /tmp/dotnet-install.sh --channel 8.0 --runtime dotnet --install-dir /usr/share/dotnet \
+  && ln -s /usr/share/dotnet/dotnet /usr/bin/dotnet \
+  && rm /tmp/dotnet-install.sh
+
 RUN mkdir -p "${XDG_CONFIG_HOME}" "${XDG_CACHE_HOME}" "${CACHE_DIR}" && chmod -R 777 "${PS_HOME}"
 
 # =========================
@@ -54,14 +54,13 @@ RUN wget -O /opt/PrusaSlicer.AppImage \
   && ln -sf /opt/prusaslicer/AppRun /usr/local/bin/prusaslicer \
   && rm -f /opt/PrusaSlicer.AppImage
 
-# Optional: tiny smoke test that does NOT fixate a datadir.
 RUN PS_TMP=/tmp/ps_check && mkdir -p "$PS_TMP/.config" "$PS_TMP/.cache" \
   && env HOME="$PS_TMP" XDG_CONFIG_HOME="$PS_TMP/.config" XDG_CACHE_HOME="$PS_TMP/.cache" \
      xvfb-run -a -s '-screen 0 1024x768x24' prusaslicer --help-sla >/dev/null \
   && rm -rf "$PS_TMP"
 
 # =========================
-# UVtools CLI (install-only)
+# UVtools CLI
 # =========================
 ARG UVTOOLS_VERSION=v4.4.2
 ARG UVTOOLS_ZIP_URL=https://github.com/sn4k3/UVtools/releases/download/v4.4.2/UVtools_linux-x64_v4.4.2.zip
@@ -71,29 +70,36 @@ RUN set -eux; \
     mkdir -p /opt/uvtools; \
     unzip /tmp/uvtools.zip -d /opt/uvtools; \
     rm -f /tmp/uvtools.zip; \
-    # Find and make executable
-    find /opt/uvtools -type f -name "UVtools*" -o -name "uvtools*" | xargs chmod +x 2>/dev/null || true; \
-    # List what we actually got
-    ls -la /opt/uvtools/; \
-    # Create wrapper that tries all possible names
-    printf '%s\n' \
+    chmod +x /opt/uvtools/UVtools 2>/dev/null || true; \
+    chmod +x /opt/uvtools/uvtools 2>/dev/null || true; \
+    chmod +x /opt/uvtools/UVtools.CLI 2>/dev/null || true; \
+    echo "=== UVtools contents ===" && ls -lah /opt/uvtools/ && echo "======================="
+
+# Create wrapper that uses dotnet to run UVtools
+RUN printf '%s\n' \
       '#!/bin/bash' \
       'set -e' \
-      'FOUND=""' \
-      'for CAND in /opt/uvtools/UVtools.CLI /opt/uvtools/UVtools /opt/uvtools/uvtools-cli /opt/uvtools/uvtools; do' \
-      '  if [ -x "$CAND" ]; then FOUND="$CAND"; break; fi' \
-      'done' \
-      'if [ -z "$FOUND" ]; then' \
-      '  echo "ERROR: No executable UVtools binary found in /opt/uvtools" >&2' \
-      '  echo "Contents:" >&2' \
-      '  ls -la /opt/uvtools/ >&2' \
-      '  exit 127' \
+      'UVTOOLS_DIR="/opt/uvtools"' \
+      '# UVtools might be a .dll that needs dotnet to run' \
+      'if [ -f "$UVTOOLS_DIR/UVtools.dll" ]; then' \
+      '  exec dotnet "$UVTOOLS_DIR/UVtools.dll" "$@"' \
       'fi' \
-      'exec "$FOUND" "$@"' \
-      > /usr/local/bin/uvtools-cli; \
-    chmod +x /usr/local/bin/uvtools-cli; \
+      '# Or it might be a standalone executable' \
+      'for exe in "$UVTOOLS_DIR/UVtools" "$UVTOOLS_DIR/UVtools.CLI" "$UVTOOLS_DIR/uvtools"; do' \
+      '  if [ -x "$exe" ]; then' \
+      '    exec "$exe" "$@"' \
+      '  fi' \
+      'done' \
+      'echo "ERROR: Could not find UVtools executable or DLL" >&2' \
+      'ls -la "$UVTOOLS_DIR" >&2' \
+      'exit 127' \
+      > /usr/local/bin/uvtools-cli && \
+    chmod +x /usr/local/bin/uvtools-cli && \
     ln -sf /usr/local/bin/uvtools-cli /usr/local/bin/uvtools
-    
+
+# Test UVtools installation
+RUN uvtools-cli --version || echo "WARNING: uvtools test failed, will debug at runtime"
+
 # =========================
 # Python deps & app
 # =========================
@@ -101,13 +107,8 @@ WORKDIR /app
 COPY requirements.txt ./requirements.txt
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Copy only application code (presets are fetched at runtime)
 COPY app ./app
 
-# Cloud Run port
 ENV PORT=8080
 
-# =========================
-# Start API (FastAPI service invokes PrusaSlicer via xvfb-run)
-# =========================
 CMD ["python3", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8080"]
