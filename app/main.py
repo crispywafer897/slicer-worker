@@ -89,14 +89,44 @@ def upload_file(bucket: str, path: str, local_path: str, content_type: str, upse
     _supabase().storage.from_(bucket).upload(path, data, file_options)
 
 def find_layers(base_dir: str) -> Optional[str]:
-    for candidate in (os.path.join(base_dir, "slices"), os.path.join(base_dir, "sla")):
-        if os.path.isdir(candidate) and glob.glob(os.path.join(candidate, "*.png")):
-            return candidate
+    # Check standard PrusaSlicer output locations first
+    standard_locations = [
+        os.path.join(base_dir, "slices"),
+        os.path.join(base_dir, "sla"),
+        os.path.join(base_dir, "SLA"),
+    ]
+    
+    # Also check for subdirectories matching common patterns
+    if os.path.exists(base_dir):
+        for item in os.listdir(base_dir):
+            item_path = os.path.join(base_dir, item)
+            if os.path.isdir(item_path):
+                standard_locations.append(os.path.join(item_path, "slices"))
+                standard_locations.append(os.path.join(item_path, "sla"))
+                standard_locations.append(item_path)  # The directory itself might contain PNGs
+    
+    # Try all standard locations
+    for candidate in standard_locations:
+        if os.path.isdir(candidate):
+            pngs = glob.glob(os.path.join(candidate, "*.png"))
+            if pngs:
+                log.info(f"Found {len(pngs)} PNG files in {candidate}")
+                return candidate
+    
+    # Fallback: recursive search for directory with most PNGs
     best_dir, best_count = None, 0
     for root, _, files in os.walk(base_dir):
-        count = sum(1 for f in files if f.lower().endswith(".png"))
+        png_files = [f for f in files if f.lower().endswith(".png")]
+        count = len(png_files)
         if count > best_count:
             best_dir, best_count = root, count
+            log.info(f"Found {count} PNGs in {root}")
+    
+    if best_dir:
+        log.info(f"Using directory with most PNGs: {best_dir} ({best_count} files)")
+    else:
+        log.warning(f"No PNG files found anywhere under {base_dir}")
+    
     return best_dir if best_count > 0 else None
 
 def find_native_artifact(base_dir: str) -> Optional[str]:
@@ -485,11 +515,23 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             except HTTPException as he:
                 update_job(job_id, status="failed", error=f"bundle_section_missing: {he.detail}")
                 return {"ok": False, "error": "bundle_section_missing"}
+            
+            # PrusaSlicer often outputs to a subdirectory named after the input file
+            input_basename = Path(input_model).stem  # filename without extension
+            potential_output_dirs = [
+                out_dir,
+                os.path.join(out_dir, input_basename),
+                wd  # Sometimes it outputs to the workspace root
+            ]
+
             attempts: List[List[str]] = []
-            attempts.append(_maybe_with_datadir(["--export-sla","--loglevel","3","--output",out_dir,"--load",str(merged_cli_ini),input_model], datadir))
-            attempts.append(_maybe_with_datadir(["--slice","--loglevel","3","--output",out_dir,"--load",str(merged_cli_ini),input_model], datadir))
+            # Try with explicit output to a file (forces directory creation)
+            output_file_base = os.path.join(out_dir, input_basename)
+            attempts.append(_maybe_with_datadir(["--export-sla","--loglevel","3","--output",output_file_base,"--load",str(merged_cli_ini),input_model], datadir))
+            attempts.append(_maybe_with_datadir(["--slice","--loglevel","3","--output",output_file_base,"--load",str(merged_cli_ini),input_model], datadir))
             project_out = os.path.join(out_dir, "project.3mf")
             attempts.append(_maybe_with_datadir(["--export-3mf","--loglevel","3","--output",project_out,"--load",str(merged_cli_ini),input_model], datadir))
+            
             success = False
             cmd1, log1 = "", ""
             for args in attempts:
@@ -500,9 +542,24 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                     break
             if not success and os.path.exists(project_out):
                 success = True
+            
+            # After slicing, search all potential output locations
+            if success:
+                log.info(f"PrusaSlicer succeeded, searching for output in multiple locations...")
+                # List everything that was created
+                for search_dir in potential_output_dirs:
+                    if os.path.exists(search_dir):
+                        log.info(f"Contents of {search_dir}:")
+                        for root, dirs, files in os.walk(search_dir):
+                            for d in dirs:
+                                log.info(f"  DIR: {os.path.join(root, d)}")
+                            for f in files:
+                                log.info(f"  FILE: {os.path.join(root, f)}")
+            
             if not success:
                 update_job(job_id, status="failed", error="prusaslicer_failed")
                 return {"ok": False, "error": "prusaslicer_failed"}
+            
             native_found = find_native_artifact(out_dir)
             if native_found:
                 found_ext = Path(native_found).suffix.lstrip(".").lower()
@@ -526,10 +583,26 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                     report = {"native_ext": native_ext, "native_source": "prusaslicer", "layers": len(glob.glob(os.path.join(slices_dir_opt, "*.png"))) if slices_dir_opt else 0}
                     update_job(job_id, status="succeeded", report=report, output_native_path=f"native:{job_prefix}/print.{native_ext}", output_project_path=(f"projects:{job_prefix}/{proj}" if proj else None), output_slices_zip_path=(f"slices:{job_prefix}/layers.zip" if zip_path else None), error=None)
                     return {"ok": True}
-            slices_dir = find_layers(out_dir)
+            
+            # Search all potential output directories for slices
+            slices_dir = None
+            for search_dir in potential_output_dirs:
+                if os.path.exists(search_dir):
+                    slices_dir = find_layers(search_dir)
+                    if slices_dir:
+                        log.info(f"Found slices in {slices_dir}")
+                        break
+            
             if not slices_dir:
-                update_job(job_id, status="failed", error=f"no_slices_found in {out_dir}")
+                # Log detailed directory structure for debugging
+                log.error(f"No slices found. Workspace structure:")
+                for root, dirs, files in os.walk(wd):
+                    log.error(f"DIR: {root}")
+                    for f in files:
+                        log.error(f"  FILE: {os.path.join(root, f)}")
+                update_job(job_id, status="failed", error=f"no_slices_found in any output location. Searched: {', '.join(potential_output_dirs)}")
                 return {"ok": False, "error": "no_slices_found"}
+            
             merged_params_path = merge_overrides(Path(params_local), job.get("overrides"))
             params_obj = _read_json(Path(merged_params_path))
             target_format = str(params_obj.get("target_format") or row.get("native_format") or "").lower().strip()
