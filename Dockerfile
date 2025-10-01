@@ -62,8 +62,8 @@ RUN PS_TMP=/tmp/ps_check && mkdir -p "$PS_TMP/.config" "$PS_TMP/.cache" \
 # =========================
 # UVtools CLI
 # =========================
-ARG UVTOOLS_VERSION=v4.4.2
-ARG UVTOOLS_ZIP_URL=https://github.com/sn4k3/UVtools/releases/download/v4.4.2/UVtools_linux-x64_v4.4.2.zip
+ARG UVTOOLS_VERSION=v5.2.1
+ARG UVTOOLS_ZIP_URL=https://github.com/sn4k3/UVtools/releases/download/v5.2.1/UVtools_linux-x64_v5.2.1.zip
 
 RUN set -eux; \
     wget -O /tmp/uvtools.zip "${UVTOOLS_ZIP_URL}"; \
