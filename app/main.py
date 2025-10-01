@@ -367,7 +367,8 @@ def uvtools_synthetic_pack_test() -> Tuple[int, str]:
             return (1, "Failed to create temp SL1")
         cmd = f"uvtools-cli convert {shlex.quote(temp_sl1)} Chitubox {shlex.quote(output_ctb)}"
         rc, logtxt = sh(cmd)
-        if rc == 0 and Path(output_ctb).exists() and Path(output_ctb).stat().st_size > 0:
+        # Check if output file was created successfully (rc may be 1 even on success)
+        if Path(output_ctb).exists() and Path(output_ctb).stat().st_size > 0 and "Done" in (logtxt or ""):
             return (0, f"synthetic convert OK → {Path(output_ctb).name} ({Path(output_ctb).stat().st_size} bytes)")
         return (rc, f"synthetic convert failed rc={rc}\n{(logtxt or '')[-2000:]}")
 
