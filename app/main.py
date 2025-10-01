@@ -12,7 +12,6 @@ try:
     from fastapi import FastAPI, Header, HTTPException
     from fastapi.responses import JSONResponse
 except Exception as e:
-    # If FastAPI cannot import, nothing else matters; raise loudly.
     log.exception("FastAPI import failed at startup")
     raise
 
@@ -266,6 +265,42 @@ def materialize_cli_config(bundle_path: str, printer_name: str, print_name: str,
             f.write(f"{k} = {v}\n")
     return out
 
+# ---------- UVtools conversion helpers ----------
+def _create_sl1_from_pngs(slices_dir: str, params_obj: Dict[str, Any], output_path: str) -> bool:
+    """Create a minimal SL1 file (ZIP) from PNG slices"""
+    try:
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            png_files = sorted(glob.glob(os.path.join(slices_dir, "*.png")))
+            if not png_files:
+                return False
+            
+            for i, png_file in enumerate(png_files):
+                zf.write(png_file, f"{i:05d}.png")
+            
+            # Minimal config.ini for SL1
+            config_ini = f"""[general]
+fileVersion = 1
+jobDir = .
+layerHeight = {params_obj.get('layer_height_mm', 0.05)}
+initialLayerCount = {params_obj.get('bottom_layers', 5)}
+printTime = 0
+materialName = Generic
+printerModel = Generic SLA
+printerVariant = default
+printProfile = default
+materialProfile = default
+numFade = 0
+numSlow = 0
+numFast = {len(png_files)}
+expTime = {params_obj.get('normal_exposure_s', 2.5)}
+expTimeFirst = {params_obj.get('bottom_exposure_s', 20.0)}
+"""
+            zf.writestr("config.ini", config_ini)
+        return True
+    except Exception as e:
+        log.error(f"Failed to create SL1: {e}")
+        return False
+
 # ---------- UVtools diagnostics ----------
 def uvtools_version() -> Tuple[int, str]:
     if not _has_uvtools():
@@ -286,19 +321,24 @@ def uvtools_synthetic_pack_test() -> Tuple[int, str]:
     with tempfile.TemporaryDirectory() as td:
         layers = Path(td) / "layers"
         layers.mkdir(parents=True, exist_ok=True)
-        _write_min_png(layers, "0001")
-        _write_min_png(layers, "0002")
-        out_path = Path(td) / "synthetic.sl1"
-        cmd = " ".join([
-            "uvtools-cli","pack",
-            "--format","sl1",
-            "--slices", shlex.quote(str(layers)),
-            "--out", shlex.quote(str(out_path))
-        ])
+        _write_min_png(str(layers), "00000")
+        _write_min_png(str(layers), "00001")
+        
+        temp_sl1 = os.path.join(td, "temp.sl1")
+        output_ctb = os.path.join(td, "test.ctb")
+        
+        # Create minimal SL1
+        params = {"layer_height_mm": 0.05, "bottom_layers": 2, "normal_exposure_s": 2.5, "bottom_exposure_s": 20.0}
+        if not _create_sl1_from_pngs(str(layers), params, temp_sl1):
+            return (1, "Failed to create temp SL1")
+        
+        # Try convert
+        cmd = f"uvtools-cli convert {shlex.quote(temp_sl1)} {shlex.quote(output_ctb)}"
         rc, logtxt = sh(cmd)
-        if rc == 0 and out_path.exists() and out_path.stat().st_size > 0:
-            return (0, f"synthetic pack OK → {out_path.name} ({out_path.stat().st_size} bytes)")
-        return (rc, f"synthetic pack failed rc={rc}\n{(logtxt or '')[-2000:]}")
+        
+        if rc == 0 and Path(output_ctb).exists() and Path(output_ctb).stat().st_size > 0:
+            return (0, f"synthetic convert OK → {Path(output_ctb).name} ({Path(output_ctb).stat().st_size} bytes)")
+        return (rc, f"synthetic convert failed rc={rc}\n{(logtxt or '')[-2000:]}")
 
 # ---------- Health/Readiness ----------
 @app.get("/healthz")
@@ -321,7 +361,6 @@ def ready():
 
 @app.get("/")
 def root():
-    # Cloud Run sometimes probes root; keep it simple.
     return {"ok": True, "service": "slicer-worker"}
 
 @app.get("/diag/uvtools")
@@ -335,7 +374,6 @@ def diag_uvtools():
         "synthetic_pack_rc": rc_p,
         "synthetic_pack_result": (log_p or "")[-1200:],
     }
-
 
 # ---------- UVtools params validation ----------
 def _validate_uvtools_params(params: Dict[str, Any], target_format: str) -> Optional[str]:
@@ -539,27 +577,19 @@ presets_available:
                                error=None)
                     return {"ok": True}
 
-                # Wrong native → unpack → pack
+                # Wrong native → unpack → convert
                 unpack_dir = os.path.join(out_dir, "unpacked_slices")
                 os.makedirs(unpack_dir, exist_ok=True)
 
                 slices_dir = None
                 log_u = ""
-                if _has_uvtools():
-                    cmd_u = " ".join(["uvtools-cli", "unpack", "--out", shlex.quote(unpack_dir), shlex.quote(native_found)])
-                    rc_u, log_u = sh(cmd_u)
-                    if rc_u == 0:
-                        slices_dir = find_layers(unpack_dir)
-                    else:
-                        log.warning("uvtools unpack failed rc=%s; will try ZIP fallback for .sl1/.sl1s", rc_u)
-
-                if not slices_dir and found_ext in ("sl1", "sl1s"):
+                if found_ext in ("sl1", "sl1s"):
                     slices_dir = _unpack_sl1_to_pngs(native_found, unpack_dir)
 
                 if not slices_dir:
                     detail = f"no_slices_found_after_unpack in {unpack_dir}"
                     if log_u:
-                        detail += f"\nuvtools_unpack_log_tail:\n{(log_u or '')[-2000:]}"
+                        detail += f"\nunpack_log_tail:\n{(log_u or '')[-2000:]}"
                     update_job(job_id, status="failed", error=detail)
                     return {"ok": False, "error": "no_slices_found_after_unpack"}
 
@@ -569,11 +599,11 @@ presets_available:
                 fmt_alias = {"ctb": params_obj.get("ctb_variant", "ctb")}
                 target_format = fmt_alias.get(target_format, target_format)
                 if not target_format:
-                    update_job(job_id, status="failed", error="uvtools_target_format_missing (no 'target_format' in params and no 'native_format' in preset)")
+                    update_job(job_id, status="failed", error="uvtools_target_format_missing")
                     return {"ok": False, "error": "uvtools_target_format_missing"}
 
                 if not _has_uvtools() and target_format not in ("sl1", "sl1s"):
-                    update_job(job_id, status="failed", error="uvtools_missing: packing to non-SL1 format (e.g., CTB) requires uvtools-cli in the container.")
+                    update_job(job_id, status="failed", error="uvtools_missing: conversion requires uvtools-cli")
                     return {"ok": False, "error": "uvtools_missing"}
 
                 native_ext = target_format
@@ -584,26 +614,21 @@ presets_available:
                     update_job(job_id, status="failed", error=f"uvtools_params_invalid: {params_err}")
                     return {"ok": False, "error": "uvtools_params_invalid"}
 
-                if _has_uvtools():
-                    cmd2_list = [
-    "uvtools-cli","pack",
-    "--loglevel","debug",
-    "--format", target_format,
-    "--params", str(merged_params_path),
-    "--slices", slices_dir,
-    "--out",    native_path
-]
-                    cmd2 = " ".join(shlex.quote(str(x)) for x in cmd2_list)
-                    rc2, log2 = sh(cmd2)
-                else:
-                    rc2, log2 = (127, "uvtools-cli not found")
+                # Create temp SL1, then convert to target format
+                temp_sl1 = os.path.join(out_dir, "temp_for_conversion.sl1")
+                if not _create_sl1_from_pngs(slices_dir, params_obj, temp_sl1):
+                    update_job(job_id, status="failed", error="failed to create temp SL1 for conversion")
+                    return {"ok": False, "error": "sl1_creation_failed"}
+
+                cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {shlex.quote(native_path)}"
+                rc2, log2 = sh(cmd2)
 
                 if rc2 != 0:
                     crash_dir = os.path.join(out_dir, "uvtools_crash")
                     os.makedirs(crash_dir, exist_ok=True)
-                    log_file = os.path.join(crash_dir, "uvtools_pack.log.txt")
+                    log_file = os.path.join(crash_dir, "uvtools_convert.log.txt")
                     Path(log_file).write_text(log2 or "", errors="ignore")
-                    storage_log_path = f"{job_id}/uvtools_pack_{int(time.time())}.log.txt"
+                    storage_log_path = f"{job_id}/uvtools_convert_{int(time.time())}.log.txt"
                     try:
                         upload_file("slices", storage_log_path, log_file, "text/plain")
                     except Exception:
@@ -612,9 +637,9 @@ presets_available:
                     update_job(
                         job_id,
                         status="failed",
-                        error=f"uvtools_failed rc={rc2}\nlog_tail:\n{(log2 or '')[-4000:]}\nlog_path:{storage_log_path or '(upload_failed)'}"
+                        error=f"uvtools_convert_failed rc={rc2}\nlog_tail:\n{(log2 or '')[-4000:]}\nlog_path:{storage_log_path or '(upload_failed)'}"
                     )
-                    return {"ok": False, "error": "uvtools_failed"}
+                    return {"ok": False, "error": "uvtools_convert_failed"}
 
                 zip_path = os.path.join(out_dir, "layers.zip")
                 with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
@@ -649,11 +674,11 @@ presets_available:
             fmt_alias = {"ctb": params_obj.get("ctb_variant", "ctb")}
             target_format = fmt_alias.get(target_format, target_format)
             if not target_format:
-                update_job(job_id, status="failed", error="uvtools_target_format_missing (no 'target_format' in params and no 'native_format' in preset)")
+                update_job(job_id, status="failed", error="uvtools_target_format_missing")
                 return {"ok": False, "error": "uvtools_target_format_missing"}
 
             if not _has_uvtools() and target_format not in ("sl1", "sl1s"):
-                update_job(job_id, status="failed", error="uvtools_missing: packing to non-SL1 format (e.g., CTB) requires uvtools-cli in the container.")
+                update_job(job_id, status="failed", error="uvtools_missing: conversion requires uvtools-cli")
                 return {"ok": False, "error": "uvtools_missing"}
 
             native_ext = target_format
@@ -664,33 +689,28 @@ presets_available:
                 update_job(job_id, status="failed", error=f"uvtools_params_invalid: {params_err}")
                 return {"ok": False, "error": "uvtools_params_invalid"}
 
-            if _has_uvtools():
-                cmd2_list = [
-    "uvtools-cli","pack",
-    "--loglevel","debug",
-    "--format", target_format,
-    "--params", str(merged_params_path),
-    "--slices", slices_dir,
-    "--out",    native_path
-]
-                cmd2 = " ".join(shlex.quote(str(x)) for x in cmd2_list)
-                rc2, log2 = sh(cmd2)
-            else:
-                rc2, log2 = (127, "uvtools-cli not found")
+            # Create temp SL1, then convert to target format
+            temp_sl1 = os.path.join(out_dir, "temp_for_conversion.sl1")
+            if not _create_sl1_from_pngs(slices_dir, params_obj, temp_sl1):
+                update_job(job_id, status="failed", error="failed to create temp SL1 for conversion")
+                return {"ok": False, "error": "sl1_creation_failed"}
+
+            cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {shlex.quote(native_path)}"
+            rc2, log2 = sh(cmd2)
 
             if rc2 != 0:
                 crash_dir = os.path.join(out_dir, "uvtools_crash")
                 os.makedirs(crash_dir, exist_ok=True)
-                log_file = os.path.join(crash_dir, "uvtools_pack.log.txt")
+                log_file = os.path.join(crash_dir, "uvtools_convert.log.txt")
                 Path(log_file).write_text(log2 or "", errors="ignore")
-                storage_log_path = f"{job_id}/uvtools_pack_{int(time.time())}.log.txt"
+                storage_log_path = f"{job_id}/uvtools_convert_{int(time.time())}.log.txt"
                 try:
                     upload_file("slices", storage_log_path, log_file, "text/plain")
                 except Exception:
                     storage_log_path = None
 
-                update_job(job_id, status="failed", error=f"uvtools_failed rc={rc2}\nlog_tail:\n{(log2 or '')[-4000:]}\nlog_path:{storage_log_path or '(upload_failed)'}")
-                return {"ok": False, "error": "uvtools_failed"}
+                update_job(job_id, status="failed", error=f"uvtools_convert_failed rc={rc2}\nlog_tail:\n{(log2 or '')[-4000:]}\nlog_path:{storage_log_path or '(upload_failed)'}")
+                return {"ok": False, "error": "uvtools_convert_failed"}
 
             zip_path = os.path.join(out_dir, "layers.zip")
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
@@ -720,6 +740,5 @@ presets_available:
             shutil.rmtree(wd, ignore_errors=True)
 
     except Exception as e:
-        # Absolutely never crash the process; surface the error in JSON
         log.exception("Fatal handler failure at /jobs")
         return JSONResponse({"ok": False, "error": f"fatal: {e}"}, status_code=200)
