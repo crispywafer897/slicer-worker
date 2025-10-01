@@ -333,7 +333,7 @@ def uvtools_synthetic_pack_test() -> Tuple[int, str]:
             return (1, "Failed to create temp SL1")
         
         # Try convert
-        cmd = f"uvtools-cli convert {shlex.quote(temp_sl1)} {shlex.quote(output_ctb)}"
+        cmd = f"uvtools-cli convert {shlex.quote(temp_sl1)} ctb {shlex.quote(output_ctb)}"
         rc, logtxt = sh(cmd)
         
         if rc == 0 and Path(output_ctb).exists() and Path(output_ctb).stat().st_size > 0:
@@ -620,8 +620,9 @@ presets_available:
                     update_job(job_id, status="failed", error="failed to create temp SL1 for conversion")
                     return {"ok": False, "error": "sl1_creation_failed"}
 
-                cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {shlex.quote(native_path)}"
-                rc2, log2 = sh(cmd2)
+                # UVtools convert needs 3 args: input-file target-type output-file
+                cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {shlex.quote(native_ext)} {shlex.quote(native_path)}"                
+                    rc2, log2 = sh(cmd2)
 
                 if rc2 != 0:
                     crash_dir = os.path.join(out_dir, "uvtools_crash")
@@ -695,7 +696,8 @@ presets_available:
                 update_job(job_id, status="failed", error="failed to create temp SL1 for conversion")
                 return {"ok": False, "error": "sl1_creation_failed"}
 
-            cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {shlex.quote(native_path)}"
+            # UVtools convert needs 3 args: input-file target-type output-file
+            cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {shlex.quote(native_ext)} {shlex.quote(native_path)}"
             rc2, log2 = sh(cmd2)
 
             if rc2 != 0:
