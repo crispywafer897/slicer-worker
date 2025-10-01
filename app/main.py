@@ -580,10 +580,45 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                             log.info(f"  NOT A DIRECTORY (is a file)")
             
             native_found = find_native_artifact(out_dir)
-            if native_found:
-                found_ext = Path(native_found).suffix.lstrip(".").lower()
-                expected_native = str(row.get("native_format", "")).lower()
-                if found_ext == expected_native and found_ext:
+if native_found:
+    found_ext = Path(native_found).suffix.lstrip(".").lower()
+    expected_native = str(row.get("native_format", "")).lower()
+    
+    # If PrusaSlicer produced .sl1 but we need a different format, extract and convert
+    if found_ext in ("sl1", "sl1s") and found_ext != expected_native:
+        log.info(f"Found {found_ext} file, extracting PNGs to convert to {expected_native}")
+        # Extract the .sl1 (it's a ZIP file with PNGs inside)
+        extract_dir = os.path.join(out_dir, "extracted_sl1")
+        os.makedirs(extract_dir, exist_ok=True)
+        try:
+            with zipfile.ZipFile(native_found, 'r') as z:
+                z.extractall(extract_dir)
+            log.info(f"Extracted .sl1 contents to {extract_dir}")
+            # Now continue to the conversion path below (don't return here)
+        except Exception as e:
+            log.error(f"Failed to extract .sl1: {e}")
+            update_job(job_id, status="failed", error=f"sl1_extraction_failed: {e}")
+            return {"ok": False, "error": "sl1_extraction_failed"}
+    elif found_ext == expected_native and found_ext:
+        # Native format matches what we want - upload directly
+        slices_dir_opt = find_layers(out_dir)
+        zip_path = None
+        if slices_dir_opt:
+            zip_path = os.path.join(out_dir, "layers.zip")
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+                for fn in sorted(glob.glob(os.path.join(slices_dir_opt, "*.png"))):
+                    z.write(fn, arcname=os.path.basename(fn))
+        native_ext = found_ext
+        job_prefix = str(job_id)
+        upload_file("native", f"{job_prefix}/print.{native_ext}", native_found, "application/octet-stream")
+        proj = next((f for f in os.listdir(out_dir) if f.endswith(".3mf")), None)
+        if proj:
+            upload_file("projects", f"{job_prefix}/{proj}", os.path.join(out_dir, proj), "model/3mf")
+        if zip_path:
+            upload_file("slices", f"{job_prefix}/layers.zip", zip_path, "application/zip")
+        report = {"native_ext": native_ext, "native_source": "prusaslicer", "layers": len(glob.glob(os.path.join(slices_dir_opt, "*.png"))) if slices_dir_opt else 0}
+        update_job(job_id, status="succeeded", report=report, output_native_path=f"native:{job_prefix}/print.{native_ext}", output_project_path=(f"projects:{job_prefix}/{proj}" if proj else None), output_slices_zip_path=(f"slices:{job_prefix}/layers.zip" if zip_path else None), error=None)
+        return {"ok": True}
                     slices_dir_opt = find_layers(out_dir)
                     zip_path = None
                     if slices_dir_opt:
