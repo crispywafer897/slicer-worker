@@ -309,7 +309,7 @@ def uvtools_synthetic_pack_test() -> Tuple[int, str]:
         params = {"layer_height_mm": 0.05, "bottom_layers": 2, "normal_exposure_s": 2.5, "bottom_exposure_s": 20.0}
         if not _create_sl1_from_pngs(str(layers), params, temp_sl1):
             return (1, "Failed to create temp SL1")
-        cmd = f"uvtools-cli convert {shlex.quote(temp_sl1)} ctb {shlex.quote(output_ctb)}"
+        cmd = f"uvtools-cli convert {shlex.quote(temp_sl1)} Chitubox {shlex.quote(output_ctb)}"
         rc, logtxt = sh(cmd)
         if rc == 0 and Path(output_ctb).exists() and Path(output_ctb).stat().st_size > 0:
             return (0, f"synthetic convert OK → {Path(output_ctb).name} ({Path(output_ctb).stat().st_size} bytes)")
@@ -491,7 +491,22 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             if not _create_sl1_from_pngs(slices_dir, params_obj, temp_sl1):
                 update_job(job_id, status="failed", error="failed to create temp SL1")
                 return {"ok": False, "error": "sl1_creation_failed"}
-            cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {shlex.quote(native_ext)} {shlex.quote(native_path)}"
+            # Map common formats to strict encoder names
+            encoder_map = {
+                "ctb": "Chitubox",
+                "ctb7": "Chitubox", 
+                "ctb2": "Chitubox",
+                "cbddlp": "Chitubox",
+                "photon": "Chitubox",
+                "photons": "AnycubicPhotonS",
+                "phz": "PHZ",
+                "pws": "Anycubic",
+                "pwmx": "Anycubic",
+                "sl1": "SL1",
+                "sl1s": "SL1",
+                            }
+encoder_name = encoder_map.get(native_ext, native_ext)
+cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {shlex.quote(encoder_name)} {shlex.quote(native_path)}"
             rc2, log2 = sh(cmd2)
             if rc2 != 0:
                 update_job(job_id, status="failed", error=f"uvtools_convert_failed rc={rc2}\n{(log2 or '')[-4000:]}")
