@@ -491,10 +491,9 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             if not _create_sl1_from_pngs(slices_dir, params_obj, temp_sl1):
                 update_job(job_id, status="failed", error="failed to create temp SL1")
                 return {"ok": False, "error": "sl1_creation_failed"}
-            # Map common formats to strict encoder names
             encoder_map = {
                 "ctb": "Chitubox",
-                "ctb7": "Chitubox", 
+                "ctb7": "Chitubox",
                 "ctb2": "Chitubox",
                 "cbddlp": "Chitubox",
                 "photon": "Chitubox",
@@ -504,9 +503,9 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 "pwmx": "Anycubic",
                 "sl1": "SL1",
                 "sl1s": "SL1",
-                            }
-encoder_name = encoder_map.get(native_ext, native_ext)
-cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {shlex.quote(encoder_name)} {shlex.quote(native_path)}"
+            }
+            encoder_name = encoder_map.get(native_ext, native_ext)
+            cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {shlex.quote(encoder_name)} {shlex.quote(native_path)}"
             rc2, log2 = sh(cmd2)
             if rc2 != 0:
                 update_job(job_id, status="failed", error=f"uvtools_convert_failed rc={rc2}\n{(log2 or '')[-4000:]}")
