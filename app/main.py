@@ -316,9 +316,30 @@ def uvtools_version() -> Tuple[int, str]:
     return sh("uvtools-cli --version")
 
 def _write_min_png(dir_path: str, name: str):
-    png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGMAAQAABQABJ7nZVQAAAABJRU5ErkJggg=="
+    # Create a proper 1x1 black PNG
+    import struct
+    
+    # PNG signature
+    png_sig = b'\x89PNG\r\n\x1a\n'
+    
+    # IHDR chunk (1x1, 8-bit grayscale)
+    ihdr_data = struct.pack('>IIBBBBB', 1, 1, 8, 0, 0, 0, 0)
+    ihdr_crc = 0x7b7df4b1  # Pre-calculated CRC for this IHDR
+    ihdr = struct.pack('>I', 13) + b'IHDR' + ihdr_data + struct.pack('>I', ihdr_crc)
+    
+    # IDAT chunk (minimal compressed data for 1x1 black pixel)
+    idat_data = b'\x08\x1d\x01\x02\x00\xfd\xff\x00\x00\x00\x02\x00\x01'
+    idat_crc = 0xb5028982  # Pre-calculated CRC
+    idat = struct.pack('>I', len(idat_data)) + b'IDAT' + idat_data + struct.pack('>I', idat_crc)
+    
+    # IEND chunk
+    iend_crc = 0xae426082  # Pre-calculated CRC for IEND
+    iend = struct.pack('>I', 0) + b'IEND' + struct.pack('>I', iend_crc)
+    
+    png_data = png_sig + ihdr + idat + iend
+    
     p = Path(dir_path) / f"{name}.png"
-    p.write_bytes(base64.b64decode(png_b64))
+    p.write_bytes(png_data)
 
 def uvtools_synthetic_pack_test() -> Tuple[int, str]:
     if not _has_uvtools():
