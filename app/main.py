@@ -316,24 +316,35 @@ def uvtools_version() -> Tuple[int, str]:
     return sh("uvtools-cli --version")
 
 def _write_min_png(dir_path: str, name: str):
-    # Create a proper 1x1 black PNG
+    # Create a proper 100x100 black PNG using PIL would be ideal, but we don't have it
+    # So create a minimal valid PNG structure manually
     import struct
+    import zlib
+    
+    width, height = 100, 100
     
     # PNG signature
     png_sig = b'\x89PNG\r\n\x1a\n'
     
-    # IHDR chunk (1x1, 8-bit grayscale)
-    ihdr_data = struct.pack('>IIBBBBB', 1, 1, 8, 0, 0, 0, 0)
-    ihdr_crc = 0x7b7df4b1  # Pre-calculated CRC for this IHDR
+    # IHDR chunk
+    ihdr_data = struct.pack('>IIBBBBB', width, height, 8, 0, 0, 0, 0)  # 8-bit grayscale
+    ihdr_crc = zlib.crc32(b'IHDR' + ihdr_data) & 0xffffffff
     ihdr = struct.pack('>I', 13) + b'IHDR' + ihdr_data + struct.pack('>I', ihdr_crc)
     
-    # IDAT chunk (minimal compressed data for 1x1 black pixel)
-    idat_data = b'\x08\x1d\x01\x02\x00\xfd\xff\x00\x00\x00\x02\x00\x01'
-    idat_crc = 0xb5028982  # Pre-calculated CRC
-    idat = struct.pack('>I', len(idat_data)) + b'IDAT' + idat_data + struct.pack('>I', idat_crc)
+    # Create image data (100x100 black pixels, grayscale)
+    # Each scanline: filter byte (0) + width bytes of pixel data
+    raw_data = b''
+    for y in range(height):
+        raw_data += b'\x00'  # Filter type 0 (none)
+        raw_data += b'\x00' * width  # Black pixels
+    
+    # IDAT chunk (compressed image data)
+    compressed = zlib.compress(raw_data, 9)
+    idat_crc = zlib.crc32(b'IDAT' + compressed) & 0xffffffff
+    idat = struct.pack('>I', len(compressed)) + b'IDAT' + compressed + struct.pack('>I', idat_crc)
     
     # IEND chunk
-    iend_crc = 0xae426082  # Pre-calculated CRC for IEND
+    iend_crc = 0xae426082
     iend = struct.pack('>I', 0) + b'IEND' + struct.pack('>I', iend_crc)
     
     png_data = png_sig + ihdr + idat + iend
