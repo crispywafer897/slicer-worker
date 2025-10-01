@@ -674,9 +674,16 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             encoder_name = encoder_map.get(native_ext, native_ext)
             cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {shlex.quote(encoder_name)} {shlex.quote(native_path)}"
             rc2, log2 = sh(cmd2)
-            if rc2 != 0:
+            # UVtools returns rc=1 even on success, so check if output file exists and log contains "Done"
+            conversion_succeeded = (
+                Path(native_path).exists() and
+                Path(native_path).stat().st_size > 0 and
+                "Done" in (log2 or "")
+            )
+            if not conversion_succeeded:
                 update_job(job_id, status="failed", error=f"uvtools_convert_failed rc={rc2}\n{(log2 or '')[-4000:]}")
                 return {"ok": False, "error": "uvtools_convert_failed"}
+            log.info(f"UVtools conversion succeeded: {native_path} ({Path(native_path).stat().st_size} bytes)")
             zip_path = os.path.join(out_dir, "layers.zip")
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
                 for fn in sorted(glob.glob(os.path.join(slices_dir, "*.png"))):
