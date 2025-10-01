@@ -543,22 +543,41 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             if not success and os.path.exists(project_out):
                 success = True
             
+            if not success:
+                # Log what we tried and what we got
+                log.error(f"PrusaSlicer attempts all failed or returned non-zero")
+                log.error(f"Last attempt log output (first 2000 chars): {log1[:2000] if log1 else 'no log'}")
+                log.error(f"Last attempt log output (last 2000 chars): {log1[-2000:] if log1 else 'no log'}")
+                update_job(job_id, status="failed", error=f"prusaslicer_failed. Last log: {log1[-500:] if log1 else 'no output'}")
+                return {"ok": False, "error": "prusaslicer_failed"}
+                # Log complete workspace structure to understand what PrusaSlicer created
+            log.info(f"=== COMPLETE WORKSPACE STRUCTURE AFTER PRUSASLICER ===")
+            log.info(f"Workspace root: {wd}")
+            all_files = []
+            for root, dirs, files in os.walk(wd):
+                rel_path = os.path.relpath(root, wd)
+                log.info(f"DIR: {rel_path}/")
+                for d in dirs:
+                    log.info(f"  SUBDIR: {d}/")
+                for f in files:
+                    full_path = os.path.join(root, f)
+                    size = os.path.getsize(full_path)
+                    log.info(f"  FILE: {f} ({size} bytes)")
+                    all_files.append(full_path)
+            log.info(f"=== END WORKSPACE STRUCTURE (Total files: {len(all_files)}) ===")
+            
             # After slicing, search all potential output locations
             if success:
                 log.info(f"PrusaSlicer succeeded, searching for output in multiple locations...")
                 # List everything that was created
                 for search_dir in potential_output_dirs:
                     if os.path.exists(search_dir):
-                        log.info(f"Contents of {search_dir}:")
-                        for root, dirs, files in os.walk(search_dir):
-                            for d in dirs:
-                                log.info(f"  DIR: {os.path.join(root, d)}")
-                            for f in files:
-                                log.info(f"  FILE: {os.path.join(root, f)}")
-            
-            if not success:
-                update_job(job_id, status="failed", error="prusaslicer_failed")
-                return {"ok": False, "error": "prusaslicer_failed"}
+                        log.info(f"Checking potential output dir: {search_dir}")
+                        if os.path.isdir(search_dir):
+                            contents = os.listdir(search_dir)
+                            log.info(f"  Contains {len(contents)} items: {contents[:20]}")  # First 20 items
+                        else:
+                            log.info(f"  NOT A DIRECTORY (is a file)")
             
             native_found = find_native_artifact(out_dir)
             if native_found:
