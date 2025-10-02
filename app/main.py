@@ -717,7 +717,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {shlex.quote(encoder_name)} {shlex.quote(native_path)}"
             log.info(f"Starting UVtools conversion at {time.strftime('%Y-%m-%d %H:%M:%S')}")
             uvtools_start = time.time()
-            rc2, log2 = sh(cmd2, timeout=300)
+            rc2, log2 = sh(cmd2, timeout=2400)
             uvtools_elapsed = time.time() - uvtools_start
             log.info(f"UVtools conversion completed in {uvtools_elapsed:.1f}s with rc={rc2}")
             
