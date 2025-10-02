@@ -453,7 +453,7 @@ def uvtools_synthetic_pack_test() -> Tuple[int, str]:
         params = {"layer_height_mm": 0.05, "bottom_layers": 2, "normal_exposure_s": 2.5, "bottom_exposure_s": 20.0}
         if not _create_sl1_from_pngs(str(layers), params, temp_sl1):
             return (1, "Failed to create temp SL1")
-        cmd = f"uvtools-cli convert {shlex.quote(temp_sl1)} Chitubox {shlex.quote(output_ctb)}"
+        cmd = f"uvtools-cli convert {shlex.quote(temp_sl1)} CTBv4 {shlex.quote(output_ctb)}"
         rc, logtxt = sh(cmd)
         if Path(output_ctb).exists() and Path(output_ctb).stat().st_size > 0 and "Done" in (logtxt or ""):
             return (0, f"synthetic convert OK → {Path(output_ctb).name} ({Path(output_ctb).stat().st_size} bytes)")
@@ -491,6 +491,16 @@ def diag_uvtools():
         "version": (log_v or "").strip().splitlines()[:2],
         "synthetic_pack_rc": rc_p,
         "synthetic_pack_result": (log_p or "")[-1200:],
+    }
+
+@app.get("/diag/encoders")
+def diag_encoders():
+    """List all available UVtools encoders"""
+    rc, output = sh("uvtools-cli convert --help", timeout=30)
+    return {
+        "rc": rc,
+        "help_output": output,
+        "has_uvtools": _has_uvtools()
     }
 
 def _validate_uvtools_params(params: Dict[str, Any], target_format: str) -> Optional[str]:
@@ -569,6 +579,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             if ("PrusaSlicer" not in (log0 or "")) and (rc0 != 0):
                 update_job(job_id, status="failed", error=f"prusaslicer_boot_failed rc={rc0}")
                 return {"ok": False, "error": "prusaslicer_boot_failed"}
+                cer_boot_failed"}
             out_dir = os.path.join(wd, "out")
             os.makedirs(out_dir, exist_ok=True)
             printer_name = row["printer_profile_name"]
@@ -740,38 +751,53 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             
             merged_params_path = merge_overrides(Path(params_local), job.get("overrides"))
             params_obj = _read_json(Path(merged_params_path))
+            
+            # Determine target format and version
             target_format = str(params_obj.get("target_format") or row.get("native_format") or "").lower().strip()
-            if target_format in ("ctb7", "ctb2", "gktwo.ctb"):
-                target_format = "ctb"
+            
+            # Check if a specific CTB version is requested
+            ctb_version = params_obj.get("ctb_version")
+            
             if not target_format:
                 update_job(job_id, status="failed", error="uvtools_target_format_missing")
                 return {"ok": False, "error": "uvtools_target_format_missing"}
-            native_ext = target_format
+            
+            native_ext = target_format if target_format != "ctb" else "ctb"
             native_path = os.path.join(out_dir, f"{file_prefix}.{native_ext}")
+            
             params_err = _validate_uvtools_params(params_obj, target_format)
             if params_err:
                 update_job(job_id, status="failed", error=f"uvtools_params_invalid: {params_err}")
                 return {"ok": False, "error": "uvtools_params_invalid"}
+            
             temp_sl1 = os.path.join(out_dir, "temp_for_conversion.sl1")
             if not _create_sl1_from_pngs(slices_dir, params_obj, temp_sl1):
                 update_job(job_id, status="failed", error="failed to create temp SL1")
                 return {"ok": False, "error": "sl1_creation_failed"}
-            encoder_map = {
-                "ctb": "Chitubox",
-                "ctb7": "Chitubox",
-                "ctb2": "Chitubox",
-                "cbddlp": "Chitubox",
-                "photon": "Chitubox",
-                "photons": "AnycubicPhotonS",
-                "phz": "PHZ",
-                "pws": "Anycubic",
-                "pwmx": "Anycubic",
-                "sl1": "SL1",
-                "sl1s": "SL1",
-            }
-            encoder_name = encoder_map.get(native_ext, native_ext)
+            
+            # Build encoder name with version specificity for CTB
+            if target_format == "ctb" and ctb_version:
+                encoder_name = f"CTBv{ctb_version}"
+                log.info(f"Using versioned CTB encoder: {encoder_name}")
+            else:
+                # Fallback map for non-CTB or non-versioned formats
+                encoder_map = {
+                    "ctb": "CTBv4",  # Default to v4 for modern printers
+                    "cbddlp": "Chitubox",
+                    "photon": "Chitubox",
+                    "photons": "AnycubicPhotonS",
+                    "phz": "PHZ",
+                    "pws": "Anycubic",
+                    "pwmx": "Anycubic",
+                    "sl1": "SL1",
+                    "sl1s": "SL1",
+                }
+                encoder_name = encoder_map.get(target_format, "CTBv4")
+                log.info(f"Using encoder: {encoder_name} for format: {target_format}")
+            
             cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {shlex.quote(encoder_name)} {shlex.quote(native_path)}"
             log.info(f"Starting UVtools conversion at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            log.info(f"UVtools command: {cmd2}")
             uvtools_start = time.time()
             rc2, log2 = sh(cmd2, timeout=1800)
             uvtools_elapsed = time.time() - uvtools_start
@@ -840,3 +866,4 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
     except Exception as e:
         log.exception("Fatal handler failure at /jobs")
         return JSONResponse({"ok": False, "error": f"fatal: {e}"}, status_code=200)
+                
