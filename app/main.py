@@ -579,7 +579,6 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             if ("PrusaSlicer" not in (log0 or "")) and (rc0 != 0):
                 update_job(job_id, status="failed", error=f"prusaslicer_boot_failed rc={rc0}")
                 return {"ok": False, "error": "prusaslicer_boot_failed"}
-                cer_boot_failed"}
             out_dir = os.path.join(wd, "out")
             os.makedirs(out_dir, exist_ok=True)
             printer_name = row["printer_profile_name"]
