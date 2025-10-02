@@ -554,7 +554,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 log.info(f"PrusaSlicer attempt {i+1}/{len(attempts)}: {' '.join(args[:3])}...")
                 log.info(f"Starting PrusaSlicer at {time.strftime('%Y-%m-%d %H:%M:%S')}")
                 start_time = time.time()
-                rc_try, log_try, cmd_try = run_prusaslicer_headless(args
+                rc_try, log_try, cmd_try = run_prusaslicer_headless(args, timeout=900)  # 15 minute timeout per attempt
                 elapsed = time.time() - start_time
                 log.info(f"PrusaSlicer attempt {i+1} completed in {elapsed:.1f}s with rc={rc_try}")
                 
