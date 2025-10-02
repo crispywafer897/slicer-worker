@@ -91,30 +91,63 @@ def signed_download(bucket: str, path: str, dest: str):
         f.write(r.read())
 
 def upload_file(bucket: str, path: str, local_path: str, content_type: str, upsert: bool = True, max_retries: int = 3):
-    data = Path(local_path).read_bytes()
-    file_options = {
-        "contentType": content_type,
-        "upsert": "true" if upsert else "false",
-        "cacheControl": "3600",
-    }
-    
-    file_size_mb = len(data) / (1024 * 1024)
+    file_size_mb = Path(local_path).stat().st_size / (1024 * 1024)
     log.info(f"Uploading {path} to {bucket} ({file_size_mb:.1f} MB)")
     
-    for attempt in range(max_retries):
-        try:
-            start = time.time()
-            _supabase().storage.from_(bucket).upload(path, data, file_options)
-            elapsed = time.time() - start
-            log.info(f"Upload succeeded in {elapsed:.1f}s (attempt {attempt + 1})")
-            return
-        except Exception as e:
-            elapsed = time.time() - start
-            log.warning(f"Upload attempt {attempt + 1} failed after {elapsed:.1f}s: {e}")
-            if attempt == max_retries - 1:
-                log.error(f"All {max_retries} upload attempts failed for {path}")
-                raise
-            time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
+    # For files > 50 MB, use streaming upload to avoid loading entire file into memory
+    if file_size_mb > 50:
+        log.info(f"Using streaming upload for large file")
+        
+        for attempt in range(max_retries):
+            try:
+                start = time.time()
+                
+                # Use requests for streaming upload since Supabase client doesn't support it well
+                import requests
+                url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{path}"
+                headers = {
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                    "Content-Type": content_type,
+                    "x-upsert": "true" if upsert else "false",
+                }
+                
+                with open(local_path, 'rb') as f:
+                    response = requests.post(url, headers=headers, data=f, timeout=600)
+                    response.raise_for_status()
+                
+                elapsed = time.time() - start
+                log.info(f"Upload succeeded in {elapsed:.1f}s (attempt {attempt + 1})")
+                return
+            except Exception as e:
+                elapsed = time.time() - start
+                log.warning(f"Upload attempt {attempt + 1} failed after {elapsed:.1f}s: {e}")
+                if attempt == max_retries - 1:
+                    log.error(f"All {max_retries} upload attempts failed for {path}")
+                    raise
+                time.sleep(2 ** attempt)
+    else:
+        # Small files can be loaded into memory
+        data = Path(local_path).read_bytes()
+        file_options = {
+            "contentType": content_type,
+            "upsert": "true" if upsert else "false",
+            "cacheControl": "3600",
+        }
+        
+        for attempt in range(max_retries):
+            try:
+                start = time.time()
+                _supabase().storage.from_(bucket).upload(path, data, file_options)
+                elapsed = time.time() - start
+                log.info(f"Upload succeeded in {elapsed:.1f}s (attempt {attempt + 1})")
+                return
+            except Exception as e:
+                elapsed = time.time() - start
+                log.warning(f"Upload attempt {attempt + 1} failed after {elapsed:.1f}s: {e}")
+                if attempt == max_retries - 1:
+                    log.error(f"All {max_retries} upload attempts failed for {path}")
+                    raise
+                time.sleep(2 ** attempt)
 
 def find_layers(base_dir: str) -> Optional[str]:
     # Check standard PrusaSlicer output locations first
@@ -374,8 +407,6 @@ def uvtools_version() -> Tuple[int, str]:
     return sh("uvtools-cli --version")
 
 def _write_min_png(dir_path: str, name: str):
-    # Create a proper 100x100 black PNG using PIL would be ideal, but we don't have it
-    # So create a minimal valid PNG structure manually
     import struct
     import zlib
     
@@ -385,18 +416,17 @@ def _write_min_png(dir_path: str, name: str):
     png_sig = b'\x89PNG\r\n\x1a\n'
     
     # IHDR chunk
-    ihdr_data = struct.pack('>IIBBBBB', width, height, 8, 0, 0, 0, 0)  # 8-bit grayscale
+    ihdr_data = struct.pack('>IIBBBBB', width, height, 8, 0, 0, 0, 0)
     ihdr_crc = zlib.crc32(b'IHDR' + ihdr_data) & 0xffffffff
     ihdr = struct.pack('>I', 13) + b'IHDR' + ihdr_data + struct.pack('>I', ihdr_crc)
     
-    # Create image data (100x100 black pixels, grayscale)
-    # Each scanline: filter byte (0) + width bytes of pixel data
+    # Create image data
     raw_data = b''
     for y in range(height):
-        raw_data += b'\x00'  # Filter type 0 (none)
-        raw_data += b'\x00' * width  # Black pixels
+        raw_data += b'\x00'
+        raw_data += b'\x00' * width
     
-    # IDAT chunk (compressed image data)
+    # IDAT chunk
     compressed = zlib.compress(raw_data, 9)
     idat_crc = zlib.crc32(b'IDAT' + compressed) & 0xffffffff
     idat = struct.pack('>I', len(compressed)) + b'IDAT' + compressed + struct.pack('>I', idat_crc)
@@ -425,7 +455,6 @@ def uvtools_synthetic_pack_test() -> Tuple[int, str]:
             return (1, "Failed to create temp SL1")
         cmd = f"uvtools-cli convert {shlex.quote(temp_sl1)} Chitubox {shlex.quote(output_ctb)}"
         rc, logtxt = sh(cmd)
-        # Check if output file was created successfully (rc may be 1 even on success)
         if Path(output_ctb).exists() and Path(output_ctb).stat().st_size > 0 and "Done" in (logtxt or ""):
             return (0, f"synthetic convert OK → {Path(output_ctb).name} ({Path(output_ctb).stat().st_size} bytes)")
         return (rc, f"synthetic convert failed rc={rc}\n{(logtxt or '')[-2000:]}")
@@ -598,14 +627,12 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                     update_job(job_id, status="failed", error=f"prusaslicer_timeout: Model too complex or large. Try simplifying the mesh. Last log: {log1[-500:]}")
                     return {"ok": False, "error": "prusaslicer_timeout"}
                 
-                # Log what we tried and what we got
                 log.error(f"PrusaSlicer attempts all failed or returned non-zero")
                 log.error(f"Last attempt log output (first 2000 chars): {log1[:2000] if log1 else 'no log'}")
                 log.error(f"Last attempt log output (last 2000 chars): {log1[-2000:] if log1 else 'no log'}")
                 update_job(job_id, status="failed", error=f"prusaslicer_failed. Last log: {log1[-500:] if log1 else 'no output'}")
                 return {"ok": False, "error": "prusaslicer_failed"}
             
-            # Log complete workspace structure to understand what PrusaSlicer created
             log.info(f"=== COMPLETE WORKSPACE STRUCTURE AFTER PRUSASLICER ===")
             log.info(f"Workspace root: {wd}")
             all_files = []
@@ -621,10 +648,8 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                     all_files.append(full_path)
             log.info(f"=== END WORKSPACE STRUCTURE (Total files: {len(all_files)}) ===")
             
-            # After slicing, search all potential output locations
             if success:
                 log.info(f"PrusaSlicer succeeded, searching for output in multiple locations...")
-                # List everything that was created
                 for search_dir in potential_output_dirs:
                     if os.path.exists(search_dir):
                         log.info(f"Checking potential output dir: {search_dir}")
@@ -639,7 +664,6 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 found_ext = Path(native_found).suffix.lstrip(".").lower()
                 expected_native = str(row.get("native_format", "")).lower()
                 
-                # If PrusaSlicer produced .sl1 but we need a different format, extract and convert
                 if found_ext in ("sl1", "sl1s") and found_ext != expected_native:
                     log.info(f"Found {found_ext} file, extracting PNGs to convert to {expected_native}")
                     extract_dir = os.path.join(out_dir, "extracted_sl1")
@@ -653,7 +677,6 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                         update_job(job_id, status="failed", error=f"sl1_extraction_failed: {e}")
                         return {"ok": False, "error": "sl1_extraction_failed"}
                 elif found_ext == expected_native and found_ext:
-                    # Native format matches what we want - upload directly
                     log.info(f"Native format matches expected: {found_ext}")
                     slices_dir_opt = find_layers(out_dir)
                     zip_path = None
@@ -665,7 +688,6 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                                 z.write(fn, arcname=os.path.basename(fn))
                     native_ext = found_ext
                     
-                    # Upload files with detailed logging
                     log.info("Starting file uploads...")
                     upload_start = time.time()
                     
@@ -699,7 +721,6 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                     log.info("Job status update completed")
                     return {"ok": True}
             
-            # Search all potential output directories for slices
             slices_dir = None
             for search_dir in potential_output_dirs:
                 if os.path.exists(search_dir):
@@ -720,7 +741,6 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             merged_params_path = merge_overrides(Path(params_local), job.get("overrides"))
             params_obj = _read_json(Path(merged_params_path))
             target_format = str(params_obj.get("target_format") or row.get("native_format") or "").lower().strip()
-            # Normalize CTB variants to just "ctb" for UVtools compatibility
             if target_format in ("ctb7", "ctb2", "gktwo.ctb"):
                 target_format = "ctb"
             if not target_format:
@@ -753,11 +773,10 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {shlex.quote(encoder_name)} {shlex.quote(native_path)}"
             log.info(f"Starting UVtools conversion at {time.strftime('%Y-%m-%d %H:%M:%S')}")
             uvtools_start = time.time()
-            rc2, log2 = sh(cmd2, timeout=1800)  # 30 min timeout for high-res printers like Saturn 4 Ultra
+            rc2, log2 = sh(cmd2, timeout=1800)
             uvtools_elapsed = time.time() - uvtools_start
             log.info(f"UVtools conversion completed in {uvtools_elapsed:.1f}s with rc={rc2}")
             
-            # UVtools returns rc=1 even on success, so check if output file exists and log contains "Done"
             conversion_succeeded = (
                 Path(native_path).exists() and
                 Path(native_path).stat().st_size > 0 and
@@ -768,13 +787,19 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 return {"ok": False, "error": "uvtools_convert_failed"}
             log.info(f"UVtools conversion succeeded: {native_path} ({Path(native_path).stat().st_size} bytes)")
             
+            # Free up memory before uploads by deleting large intermediate files
+            log.info("Cleaning up intermediate files to free memory before uploads")
+            if os.path.exists(temp_sl1):
+                temp_sl1_size = os.path.getsize(temp_sl1) / (1024 * 1024)
+                os.remove(temp_sl1)
+                log.info(f"Deleted temp SL1 file ({temp_sl1_size:.1f} MB)")
+            
             zip_path = os.path.join(out_dir, f"{file_prefix}_layers.zip")
             log.info(f"Creating layers ZIP at {zip_path}")
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
                 for fn in sorted(glob.glob(os.path.join(slices_dir, "*.png"))):
                     z.write(fn, arcname=os.path.basename(fn))
             
-            # Upload files with detailed logging
             log.info("Starting file uploads...")
             upload_start = time.time()
             
