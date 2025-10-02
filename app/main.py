@@ -55,9 +55,20 @@ def _supabase():
         raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-def sh(cmd: str, cwd: Optional[str] = None, env: Optional[dict] = None) -> Tuple[int, str]:
-    p = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True, text=True, env=env)
-    return p.returncode, (p.stdout or "") + (p.stderr or "")
+def sh(cmd: str, cwd: Optional[str] = None, env: Optional[dict] = None, timeout: Optional[int] = None) -> Tuple[int, str]:
+    try:
+        p = subprocess.run(
+            cmd, 
+            shell=True, 
+            cwd=cwd, 
+            capture_output=True, 
+            text=True, 
+            env=env,
+            timeout=timeout
+        )
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except subprocess.TimeoutExpired as e:
+        return (124, f"TIMEOUT after {timeout}s\nstdout: {e.stdout or ''}\nstderr: {e.stderr or ''}")
 
 def update_job(job_id: str, **fields):
     try:
@@ -234,13 +245,13 @@ def _base_env() -> dict:
     env.setdefault("XDG_CACHE_HOME", os.path.join(ps_home, ".cache"))
     return env
 
-def run_prusaslicer_headless(args: List[str]) -> Tuple[int, str, str]:
+def run_prusaslicer_headless(args: List[str], timeout: int = 900) -> Tuple[int, str, str]:
     env = _base_env()
     _ensure_minimal_user_config(env)
     base = ["xvfb-run", "-a", "-s", "-screen 0 1024x768x24", PRUSA_APPIMAGE]
     cmd_list = base + args
     cmd_str = " ".join(shlex.quote(x) for x in cmd_list)
-    rc, logtxt = sh(cmd_str, env=env)
+    rc, logtxt = sh(cmd_str, env=env, timeout=timeout)
     return rc, logtxt, cmd_str
 
 def _resolve_datadir_opt_in() -> Optional[str]:
@@ -488,6 +499,13 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 return {"ok": False, "error": "unsupported_model_extension"}
             input_model = os.path.join(wd, base_name)
             signed_download(bucket, path_in_bucket, input_model)
+            
+            # Extract clean filename and create unique naming prefix
+            original_stem = Path(base_name).stem
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            file_prefix = f"{original_stem}_{job_id}_{timestamp}"
+            log.info(f"File prefix for outputs: {file_prefix}")
+            
             printer_id_raw = job.get("printer_id", "")
             if not printer_id_raw:
                 update_job(job_id, status="failed", error="missing printer_id")
@@ -501,7 +519,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             row = preset["row"]
             bundle_local = preset["bundle_local"]
             params_local = preset["params_local"]
-            rc0, log0, cmd0 = run_prusaslicer_headless(_maybe_with_datadir(["--help"], datadir))
+            rc0, log0, cmd0 = run_prusaslicer_headless(_maybe_with_datadir(["--help"], datadir), timeout=30)
             if ("PrusaSlicer" not in (log0 or "")) and (rc0 != 0):
                 update_job(job_id, status="failed", error=f"prusaslicer_boot_failed rc={rc0}")
                 return {"ok": False, "error": "prusaslicer_boot_failed"}
@@ -517,16 +535,14 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 return {"ok": False, "error": "bundle_section_missing"}
             
             # PrusaSlicer often outputs to a subdirectory named after the input file
-            input_basename = Path(input_model).stem  # filename without extension
+            input_basename = Path(input_model).stem
             potential_output_dirs = [
                 out_dir,
                 os.path.join(out_dir, input_basename),
-                wd  # Sometimes it outputs to the workspace root
+                wd
             ]
 
             attempts: List[List[str]] = []
-            # Use the out_dir directly - let PrusaSlicer manage subdirectories
-            # The key is to NOT specify a basename without extension, as that creates a file
             attempts.append(_maybe_with_datadir(["--export-sla","--loglevel","3","--output",out_dir + "/","--load",str(merged_cli_ini),input_model], datadir))
             attempts.append(_maybe_with_datadir(["--slice","--loglevel","3","--output",out_dir + "/","--load",str(merged_cli_ini),input_model], datadir))
             project_out = os.path.join(out_dir, "project.3mf")
@@ -534,23 +550,45 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             
             success = False
             cmd1, log1 = "", ""
-            for args in attempts:
-                rc_try, log_try, cmd_try = run_prusaslicer_headless(args)
+            for i, args in enumerate(attempts):
+                log.info(f"PrusaSlicer attempt {i+1}/{len(attempts)}: {' '.join(args[:3])}...")
+                log.info(f"Starting PrusaSlicer at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                start_time = time.time()
+                rc_try, log_try, cmd_try = run_prusaslicer_headless(args
+                elapsed = time.time() - start_time
+                log.info(f"PrusaSlicer attempt {i+1} completed in {elapsed:.1f}s with rc={rc_try}")
+                
+                if rc_try == 124:  # Timeout
+                    log.error(f"PrusaSlicer timed out after 900s on attempt {i+1}")
+                    cmd1, log1 = cmd_try, log_try
+                    continue
+                
                 if rc_try == 0:
                     success = True
                     cmd1, log1 = cmd_try, log_try
+                    log.info(f"PrusaSlicer succeeded on attempt {i+1}")
                     break
+                else:
+                    cmd1, log1 = cmd_try, log_try
+                    log.warning(f"PrusaSlicer attempt {i+1} failed with rc={rc_try}, trying next...")
+            
             if not success and os.path.exists(project_out):
                 success = True
             
             if not success:
+                # Check if it was a timeout
+                if "TIMEOUT" in log1:
+                    update_job(job_id, status="failed", error=f"prusaslicer_timeout: Model too complex or large. Try simplifying the mesh. Last log: {log1[-500:]}")
+                    return {"ok": False, "error": "prusaslicer_timeout"}
+                
                 # Log what we tried and what we got
                 log.error(f"PrusaSlicer attempts all failed or returned non-zero")
                 log.error(f"Last attempt log output (first 2000 chars): {log1[:2000] if log1 else 'no log'}")
                 log.error(f"Last attempt log output (last 2000 chars): {log1[-2000:] if log1 else 'no log'}")
                 update_job(job_id, status="failed", error=f"prusaslicer_failed. Last log: {log1[-500:] if log1 else 'no output'}")
                 return {"ok": False, "error": "prusaslicer_failed"}
-                # Log complete workspace structure to understand what PrusaSlicer created
+            
+            # Log complete workspace structure to understand what PrusaSlicer created
             log.info(f"=== COMPLETE WORKSPACE STRUCTURE AFTER PRUSASLICER ===")
             log.info(f"Workspace root: {wd}")
             all_files = []
@@ -575,7 +613,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                         log.info(f"Checking potential output dir: {search_dir}")
                         if os.path.isdir(search_dir):
                             contents = os.listdir(search_dir)
-                            log.info(f"  Contains {len(contents)} items: {contents[:20]}")  # First 20 items
+                            log.info(f"  Contains {len(contents)} items: {contents[:20]}")
                         else:
                             log.info(f"  NOT A DIRECTORY (is a file)")
             
@@ -587,14 +625,12 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 # If PrusaSlicer produced .sl1 but we need a different format, extract and convert
                 if found_ext in ("sl1", "sl1s") and found_ext != expected_native:
                     log.info(f"Found {found_ext} file, extracting PNGs to convert to {expected_native}")
-                    # Extract the .sl1 (it's a ZIP file with PNGs inside)
                     extract_dir = os.path.join(out_dir, "extracted_sl1")
                     os.makedirs(extract_dir, exist_ok=True)
                     try:
                         with zipfile.ZipFile(native_found, 'r') as z:
                             z.extractall(extract_dir)
                         log.info(f"Extracted .sl1 contents to {extract_dir}")
-                        # Now continue to the conversion path below (don't return here)
                     except Exception as e:
                         log.error(f"Failed to extract .sl1: {e}")
                         update_job(job_id, status="failed", error=f"sl1_extraction_failed: {e}")
@@ -604,20 +640,27 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                     slices_dir_opt = find_layers(out_dir)
                     zip_path = None
                     if slices_dir_opt:
-                        zip_path = os.path.join(out_dir, "layers.zip")
+                        zip_path = os.path.join(out_dir, f"{file_prefix}_layers.zip")
                         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
                             for fn in sorted(glob.glob(os.path.join(slices_dir_opt, "*.png"))):
                                 z.write(fn, arcname=os.path.basename(fn))
                     native_ext = found_ext
-                    job_prefix = str(job_id)
-                    upload_file("native", f"{job_prefix}/print.{native_ext}", native_found, "application/octet-stream")
+                    upload_file("native", f"{job_id}/{file_prefix}.{native_ext}", native_found, "application/octet-stream")
                     proj = next((f for f in os.listdir(out_dir) if f.endswith(".3mf")), None)
                     if proj:
-                        upload_file("projects", f"{job_prefix}/{proj}", os.path.join(out_dir, proj), "model/3mf")
+                        upload_file("projects", f"{job_id}/{file_prefix}.3mf", os.path.join(out_dir, proj), "model/3mf")
                     if zip_path:
-                        upload_file("slices", f"{job_prefix}/layers.zip", zip_path, "application/zip")
+                        upload_file("slices", f"{job_id}/{file_prefix}_layers.zip", zip_path, "application/zip")
                     report = {"native_ext": native_ext, "native_source": "prusaslicer", "layers": len(glob.glob(os.path.join(slices_dir_opt, "*.png"))) if slices_dir_opt else 0}
-                    update_job(job_id, status="succeeded", report=report, output_native_path=f"native:{job_prefix}/print.{native_ext}", output_project_path=(f"projects:{job_prefix}/{proj}" if proj else None), output_slices_zip_path=(f"slices:{job_prefix}/layers.zip" if zip_path else None), error=None)
+                    update_job(
+                        job_id, 
+                        status="succeeded", 
+                        report=report, 
+                        output_native_path=f"native:{job_id}/{file_prefix}.{native_ext}", 
+                        output_project_path=(f"projects:{job_id}/{file_prefix}.3mf" if proj else None), 
+                        output_slices_zip_path=(f"slices:{job_id}/{file_prefix}_layers.zip" if zip_path else None), 
+                        error=None
+                    )
                     return {"ok": True}
             
             # Search all potential output directories for slices
@@ -630,7 +673,6 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                         break
             
             if not slices_dir:
-                # Log detailed directory structure for debugging
                 log.error(f"No slices found. Workspace structure:")
                 for root, dirs, files in os.walk(wd):
                     log.error(f"DIR: {root}")
@@ -649,7 +691,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 update_job(job_id, status="failed", error="uvtools_target_format_missing")
                 return {"ok": False, "error": "uvtools_target_format_missing"}
             native_ext = target_format
-            native_path = os.path.join(out_dir, f"print.{native_ext}")
+            native_path = os.path.join(out_dir, f"{file_prefix}.{native_ext}")
             params_err = _validate_uvtools_params(params_obj, target_format)
             if params_err:
                 update_job(job_id, status="failed", error=f"uvtools_params_invalid: {params_err}")
@@ -673,7 +715,12 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             }
             encoder_name = encoder_map.get(native_ext, native_ext)
             cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {shlex.quote(encoder_name)} {shlex.quote(native_path)}"
-            rc2, log2 = sh(cmd2)
+            log.info(f"Starting UVtools conversion at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            uvtools_start = time.time()
+            rc2, log2 = sh(cmd2, timeout=300)
+            uvtools_elapsed = time.time() - uvtools_start
+            log.info(f"UVtools conversion completed in {uvtools_elapsed:.1f}s with rc={rc2}")
+            
             # UVtools returns rc=1 even on success, so check if output file exists and log contains "Done"
             conversion_succeeded = (
                 Path(native_path).exists() and
@@ -684,20 +731,31 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 update_job(job_id, status="failed", error=f"uvtools_convert_failed rc={rc2}\n{(log2 or '')[-4000:]}")
                 return {"ok": False, "error": "uvtools_convert_failed"}
             log.info(f"UVtools conversion succeeded: {native_path} ({Path(native_path).stat().st_size} bytes)")
-            zip_path = os.path.join(out_dir, "layers.zip")
+            
+            zip_path = os.path.join(out_dir, f"{file_prefix}_layers.zip")
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
                 for fn in sorted(glob.glob(os.path.join(slices_dir, "*.png"))):
                     z.write(fn, arcname=os.path.basename(fn))
-            job_prefix = str(job_id)
-            upload_file("native", f"{job_prefix}/print.{native_ext}", native_path, "application/octet-stream")
+            
+            upload_file("native", f"{job_id}/{file_prefix}.{native_ext}", native_path, "application/octet-stream")
             proj = next((f for f in os.listdir(out_dir) if f.endswith(".3mf")), None)
             if proj:
-                upload_file("projects", f"{job_prefix}/{proj}", os.path.join(out_dir, proj), "model/3mf")
-            upload_file("slices", f"{job_prefix}/layers.zip", zip_path, "application/zip")
+                upload_file("projects", f"{job_id}/{file_prefix}.3mf", os.path.join(out_dir, proj), "model/3mf")
+            upload_file("slices", f"{job_id}/{file_prefix}_layers.zip", zip_path, "application/zip")
+            
             report = {"native_ext": native_ext, "native_source": "uvtools", "layers": len(glob.glob(os.path.join(slices_dir, "*.png")))}
-            update_job(job_id, status="succeeded", report=report, output_native_path=f"native:{job_prefix}/print.{native_ext}", output_project_path=(f"projects:{job_prefix}/{proj}" if proj else None), output_slices_zip_path=f"slices:{job_prefix}/layers.zip", error=None)
+            update_job(
+                job_id, 
+                status="succeeded", 
+                report=report, 
+                output_native_path=f"native:{job_id}/{file_prefix}.{native_ext}", 
+                output_project_path=(f"projects:{job_id}/{file_prefix}.3mf" if proj else None), 
+                output_slices_zip_path=f"slices:{job_id}/{file_prefix}_layers.zip", 
+                error=None
+            )
             return {"ok": True}
         except Exception as e:
+            log.exception("Exception during job processing")
             update_job(job_id, status="failed", error=f"{type(e).__name__}: {e}")
             return {"ok": False, "error": str(e)}
         finally:
