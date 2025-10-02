@@ -94,7 +94,6 @@ def upload_file(bucket: str, path: str, local_path: str, content_type: str, upse
     file_size_mb = Path(local_path).stat().st_size / (1024 * 1024)
     log.info(f"Uploading {path} to {bucket} ({file_size_mb:.1f} MB)")
     
-    # For files > 50 MB, use streaming upload to avoid loading entire file into memory
     if file_size_mb > 50:
         log.info(f"Using streaming upload for large file")
         
@@ -102,7 +101,6 @@ def upload_file(bucket: str, path: str, local_path: str, content_type: str, upse
             try:
                 start = time.time()
                 
-                # Use requests for streaming upload since Supabase client doesn't support it well
                 import requests
                 url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{path}"
                 headers = {
@@ -126,7 +124,6 @@ def upload_file(bucket: str, path: str, local_path: str, content_type: str, upse
                     raise
                 time.sleep(2 ** attempt)
     else:
-        # Small files can be loaded into memory
         data = Path(local_path).read_bytes()
         file_options = {
             "contentType": content_type,
@@ -150,23 +147,20 @@ def upload_file(bucket: str, path: str, local_path: str, content_type: str, upse
                 time.sleep(2 ** attempt)
 
 def find_layers(base_dir: str) -> Optional[str]:
-    # Check standard PrusaSlicer output locations first
     standard_locations = [
         os.path.join(base_dir, "slices"),
         os.path.join(base_dir, "sla"),
         os.path.join(base_dir, "SLA"),
     ]
     
-    # Also check for subdirectories matching common patterns
     if os.path.exists(base_dir):
         for item in os.listdir(base_dir):
             item_path = os.path.join(base_dir, item)
             if os.path.isdir(item_path):
                 standard_locations.append(os.path.join(item_path, "slices"))
                 standard_locations.append(os.path.join(item_path, "sla"))
-                standard_locations.append(item_path)  # The directory itself might contain PNGs
+                standard_locations.append(item_path)
     
-    # Try all standard locations
     for candidate in standard_locations:
         if os.path.isdir(candidate):
             pngs = glob.glob(os.path.join(candidate, "*.png"))
@@ -174,7 +168,6 @@ def find_layers(base_dir: str) -> Optional[str]:
                 log.info(f"Found {len(pngs)} PNG files in {candidate}")
                 return candidate
     
-    # Fallback: recursive search for directory with most PNGs
     best_dir, best_count = None, 0
     for root, _, files in os.walk(base_dir):
         png_files = [f for f in files if f.lower().endswith(".png")]
@@ -355,7 +348,6 @@ def _create_sl1_from_pngs(slices_dir: str, params_obj: Dict[str, Any], output_pa
             for i, png_file in enumerate(png_files):
                 zf.write(png_file, f"{i:05d}.png")
             
-            # Create prusaslicer.ini (required by UVtools)
             layer_height = params_obj.get('layer_height_mm', 0.05)
             bottom_layers = params_obj.get('bottom_layers', 5)
             normal_exp = params_obj.get('normal_exposure_s', 2.5)
@@ -377,7 +369,6 @@ printProfile = default
 """
             zf.writestr("prusaslicer.ini", prusaslicer_ini)
             
-            # Also create config.ini for compatibility
             config_ini = f"""[general]
 fileVersion = 1
 jobDir = job1
@@ -412,26 +403,21 @@ def _write_min_png(dir_path: str, name: str):
     
     width, height = 100, 100
     
-    # PNG signature
     png_sig = b'\x89PNG\r\n\x1a\n'
     
-    # IHDR chunk
     ihdr_data = struct.pack('>IIBBBBB', width, height, 8, 0, 0, 0, 0)
     ihdr_crc = zlib.crc32(b'IHDR' + ihdr_data) & 0xffffffff
     ihdr = struct.pack('>I', 13) + b'IHDR' + ihdr_data + struct.pack('>I', ihdr_crc)
     
-    # Create image data
     raw_data = b''
     for y in range(height):
         raw_data += b'\x00'
         raw_data += b'\x00' * width
     
-    # IDAT chunk
     compressed = zlib.compress(raw_data, 9)
     idat_crc = zlib.crc32(b'IDAT' + compressed) & 0xffffffff
     idat = struct.pack('>I', len(compressed)) + b'IDAT' + compressed + struct.pack('>I', idat_crc)
     
-    # IEND chunk
     iend_crc = 0xae426082
     iend = struct.pack('>I', 0) + b'IEND' + struct.pack('>I', iend_crc)
     
@@ -453,7 +439,7 @@ def uvtools_synthetic_pack_test() -> Tuple[int, str]:
         params = {"layer_height_mm": 0.05, "bottom_layers": 2, "normal_exposure_s": 2.5, "bottom_exposure_s": 20.0}
         if not _create_sl1_from_pngs(str(layers), params, temp_sl1):
             return (1, "Failed to create temp SL1")
-        cmd = f"uvtools-cli convert {shlex.quote(temp_sl1)} CTBv4 {shlex.quote(output_ctb)}"
+        cmd = f"uvtools-cli convert {shlex.quote(temp_sl1)} ctb {shlex.quote(output_ctb)} --version 4"
         rc, logtxt = sh(cmd)
         if Path(output_ctb).exists() and Path(output_ctb).stat().st_size > 0 and "Done" in (logtxt or ""):
             return (0, f"synthetic convert OK → {Path(output_ctb).name} ({Path(output_ctb).stat().st_size} bytes)")
@@ -495,7 +481,6 @@ def diag_uvtools():
 
 @app.get("/diag/encoders")
 def diag_encoders():
-    """List all available UVtools encoders"""
     rc, output = sh("uvtools-cli convert --help", timeout=30)
     return {
         "rc": rc,
@@ -556,7 +541,6 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             input_model = os.path.join(wd, base_name)
             signed_download(bucket, path_in_bucket, input_model)
             
-            # Extract clean filename and create unique naming prefix
             original_stem = Path(base_name).stem
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             file_prefix = f"{original_stem}_{job_id}_{timestamp}"
@@ -588,9 +572,8 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 merged_cli_ini = materialize_cli_config(bundle_local, printer_name, print_profile, material_profile, dest_dir=wd)
             except HTTPException as he:
                 update_job(job_id, status="failed", error=f"bundle_section_missing: {he.detail}")
-                return {"ok": False, "error": "bundle_section_missing"}
+                return {"ok": False, "error":"bundle_section_missing"}
             
-            # PrusaSlicer often outputs to a subdirectory named after the input file
             input_basename = Path(input_model).stem
             potential_output_dirs = [
                 out_dir,
@@ -614,7 +597,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 elapsed = time.time() - start_time
                 log.info(f"PrusaSlicer attempt {i+1} completed in {elapsed:.1f}s with rc={rc_try}")
                 
-                if rc_try == 124:  # Timeout
+                if rc_try == 124:
                     log.error(f"PrusaSlicer timed out after 900s on attempt {i+1}")
                     cmd1, log1 = cmd_try, log_try
                     continue
@@ -632,7 +615,6 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 success = True
             
             if not success:
-                # Check if it was a timeout
                 if "TIMEOUT" in log1:
                     update_job(job_id, status="failed", error=f"prusaslicer_timeout: Model too complex or large. Try simplifying the mesh. Last log: {log1[-500:]}")
                     return {"ok": False, "error": "prusaslicer_timeout"}
@@ -751,10 +733,8 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             merged_params_path = merge_overrides(Path(params_local), job.get("overrides"))
             params_obj = _read_json(Path(merged_params_path))
             
-            # Determine target format and version
             target_format = str(params_obj.get("target_format") or row.get("native_format") or "").lower().strip()
             
-            # Check if a specific CTB version is requested
             ctb_version = params_obj.get("ctb_version")
             
             if not target_format:
@@ -774,29 +754,26 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 update_job(job_id, status="failed", error="failed to create temp SL1")
                 return {"ok": False, "error": "sl1_creation_failed"}
             
-            # Build encoder name with version specificity for CTB
             if target_format == "ctb" and ctb_version:
-                encoder_name = f"CTBv{ctb_version}"
-                log.info(f"Using versioned CTB encoder: {encoder_name}")
+                cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} ctb {shlex.quote(native_path)} --version {ctb_version}"
+                log.info(f"Using CTB format with explicit version: {ctb_version}")
             else:
-                # Fallback map for non-CTB or non-versioned formats
                 encoder_map = {
-                    "ctb": "CTBv4",  # Default to v4 for modern printers
-                    "cbddlp": "Chitubox",
-                    "photon": "Chitubox",
-                    "photons": "AnycubicPhotonS",
-                    "phz": "PHZ",
-                    "pws": "Anycubic",
-                    "pwmx": "Anycubic",
-                    "sl1": "SL1",
-                    "sl1s": "SL1",
+                    "ctb": "ctb",
+                    "cbddlp": "cbddlp",
+                    "photon": "photon",
+                    "phz": "phz",
+                    "pws": "pws",
+                    "pwmx": "pwmx",
+                    "sl1": "sl1",
+                    "sl1s": "sl1s",
                 }
-                encoder_name = encoder_map.get(target_format, "CTBv4")
+                encoder_name = encoder_map.get(target_format, "ctb")
+                cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {encoder_name} {shlex.quote(native_path)}"
                 log.info(f"Using encoder: {encoder_name} for format: {target_format}")
             
-            cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {shlex.quote(encoder_name)} {shlex.quote(native_path)}"
-            log.info(f"Starting UVtools conversion at {time.strftime('%Y-%m-%d %H:%M:%S')}")
             log.info(f"UVtools command: {cmd2}")
+            log.info(f"Starting UVtools conversion at {time.strftime('%Y-%m-%d %H:%M:%S')}")
             uvtools_start = time.time()
             rc2, log2 = sh(cmd2, timeout=1800)
             uvtools_elapsed = time.time() - uvtools_start
@@ -812,7 +789,6 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 return {"ok": False, "error": "uvtools_convert_failed"}
             log.info(f"UVtools conversion succeeded: {native_path} ({Path(native_path).stat().st_size} bytes)")
             
-            # Free up memory before uploads by deleting large intermediate files
             log.info("Cleaning up intermediate files to free memory before uploads")
             if os.path.exists(temp_sl1):
                 temp_sl1_size = os.path.getsize(temp_sl1) / (1024 * 1024)
@@ -865,4 +841,3 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
     except Exception as e:
         log.exception("Fatal handler failure at /jobs")
         return JSONResponse({"ok": False, "error": f"fatal: {e}"}, status_code=200)
-                
