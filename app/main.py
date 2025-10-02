@@ -90,14 +90,31 @@ def signed_download(bucket: str, path: str, dest: str):
     with urllib.request.urlopen(url) as r, open(dest, "wb") as f:
         f.write(r.read())
 
-def upload_file(bucket: str, path: str, local_path: str, content_type: str, upsert: bool = True):
+def upload_file(bucket: str, path: str, local_path: str, content_type: str, upsert: bool = True, max_retries: int = 3):
     data = Path(local_path).read_bytes()
     file_options = {
         "contentType": content_type,
         "upsert": "true" if upsert else "false",
         "cacheControl": "3600",
     }
-    _supabase().storage.from_(bucket).upload(path, data, file_options)
+    
+    file_size_mb = len(data) / (1024 * 1024)
+    log.info(f"Uploading {path} to {bucket} ({file_size_mb:.1f} MB)")
+    
+    for attempt in range(max_retries):
+        try:
+            start = time.time()
+            _supabase().storage.from_(bucket).upload(path, data, file_options)
+            elapsed = time.time() - start
+            log.info(f"Upload succeeded in {elapsed:.1f}s (attempt {attempt + 1})")
+            return
+        except Exception as e:
+            elapsed = time.time() - start
+            log.warning(f"Upload attempt {attempt + 1} failed after {elapsed:.1f}s: {e}")
+            if attempt == max_retries - 1:
+                log.error(f"All {max_retries} upload attempts failed for {path}")
+                raise
+            time.sleep(2 ** attempt)  # Exponential backoff: 1s, 2s, 4s
 
 def find_layers(base_dir: str) -> Optional[str]:
     # Check standard PrusaSlicer output locations first
@@ -554,7 +571,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 log.info(f"PrusaSlicer attempt {i+1}/{len(attempts)}: {' '.join(args[:3])}...")
                 log.info(f"Starting PrusaSlicer at {time.strftime('%Y-%m-%d %H:%M:%S')}")
                 start_time = time.time()
-                rc_try, log_try, cmd_try = run_prusaslicer_headless(args, timeout=900)  # 15 minute timeout per attempt
+                rc_try, log_try, cmd_try = run_prusaslicer_headless(args, timeout=900)
                 elapsed = time.time() - start_time
                 log.info(f"PrusaSlicer attempt {i+1} completed in {elapsed:.1f}s with rc={rc_try}")
                 
@@ -637,21 +654,39 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                         return {"ok": False, "error": "sl1_extraction_failed"}
                 elif found_ext == expected_native and found_ext:
                     # Native format matches what we want - upload directly
+                    log.info(f"Native format matches expected: {found_ext}")
                     slices_dir_opt = find_layers(out_dir)
                     zip_path = None
                     if slices_dir_opt:
                         zip_path = os.path.join(out_dir, f"{file_prefix}_layers.zip")
+                        log.info(f"Creating layers ZIP at {zip_path}")
                         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
                             for fn in sorted(glob.glob(os.path.join(slices_dir_opt, "*.png"))):
                                 z.write(fn, arcname=os.path.basename(fn))
                     native_ext = found_ext
+                    
+                    # Upload files with detailed logging
+                    log.info("Starting file uploads...")
+                    upload_start = time.time()
+                    
+                    log.info(f"Uploading native file: {file_prefix}.{native_ext}")
                     upload_file("native", f"{job_id}/{file_prefix}.{native_ext}", native_found, "application/octet-stream")
+                    
                     proj = next((f for f in os.listdir(out_dir) if f.endswith(".3mf")), None)
                     if proj:
+                        log.info(f"Uploading 3MF project file: {file_prefix}.3mf")
                         upload_file("projects", f"{job_id}/{file_prefix}.3mf", os.path.join(out_dir, proj), "model/3mf")
+                    
                     if zip_path:
+                        log.info(f"Uploading layers ZIP: {file_prefix}_layers.zip")
                         upload_file("slices", f"{job_id}/{file_prefix}_layers.zip", zip_path, "application/zip")
+                    
+                    upload_elapsed = time.time() - upload_start
+                    log.info(f"All uploads completed in {upload_elapsed:.1f}s")
+                    
                     report = {"native_ext": native_ext, "native_source": "prusaslicer", "layers": len(glob.glob(os.path.join(slices_dir_opt, "*.png"))) if slices_dir_opt else 0}
+                    
+                    log.info("Updating job status to succeeded")
                     update_job(
                         job_id, 
                         status="succeeded", 
@@ -661,6 +696,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                         output_slices_zip_path=(f"slices:{job_id}/{file_prefix}_layers.zip" if zip_path else None), 
                         error=None
                     )
+                    log.info("Job status update completed")
                     return {"ok": True}
             
             # Search all potential output directories for slices
@@ -717,7 +753,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {shlex.quote(encoder_name)} {shlex.quote(native_path)}"
             log.info(f"Starting UVtools conversion at {time.strftime('%Y-%m-%d %H:%M:%S')}")
             uvtools_start = time.time()
-            rc2, log2 = sh(cmd2, timeout=2400)
+            rc2, log2 = sh(cmd2, timeout=1800)  # 30 min timeout for high-res printers like Saturn 4 Ultra
             uvtools_elapsed = time.time() - uvtools_start
             log.info(f"UVtools conversion completed in {uvtools_elapsed:.1f}s with rc={rc2}")
             
@@ -733,17 +769,32 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             log.info(f"UVtools conversion succeeded: {native_path} ({Path(native_path).stat().st_size} bytes)")
             
             zip_path = os.path.join(out_dir, f"{file_prefix}_layers.zip")
+            log.info(f"Creating layers ZIP at {zip_path}")
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
                 for fn in sorted(glob.glob(os.path.join(slices_dir, "*.png"))):
                     z.write(fn, arcname=os.path.basename(fn))
             
+            # Upload files with detailed logging
+            log.info("Starting file uploads...")
+            upload_start = time.time()
+            
+            log.info(f"Uploading native CTB file: {file_prefix}.{native_ext}")
             upload_file("native", f"{job_id}/{file_prefix}.{native_ext}", native_path, "application/octet-stream")
+            
             proj = next((f for f in os.listdir(out_dir) if f.endswith(".3mf")), None)
             if proj:
+                log.info(f"Uploading 3MF project file: {file_prefix}.3mf")
                 upload_file("projects", f"{job_id}/{file_prefix}.3mf", os.path.join(out_dir, proj), "model/3mf")
+            
+            log.info(f"Uploading layers ZIP: {file_prefix}_layers.zip")
             upload_file("slices", f"{job_id}/{file_prefix}_layers.zip", zip_path, "application/zip")
             
+            upload_elapsed = time.time() - upload_start
+            log.info(f"All uploads completed in {upload_elapsed:.1f}s")
+            
             report = {"native_ext": native_ext, "native_source": "uvtools", "layers": len(glob.glob(os.path.join(slices_dir, "*.png")))}
+            
+            log.info("Updating job status to succeeded")
             update_job(
                 job_id, 
                 status="succeeded", 
@@ -753,6 +804,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 output_slices_zip_path=f"slices:{job_id}/{file_prefix}_layers.zip", 
                 error=None
             )
+            log.info("Job status update completed")
             return {"ok": True}
         except Exception as e:
             log.exception("Exception during job processing")
