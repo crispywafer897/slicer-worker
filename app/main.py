@@ -348,11 +348,32 @@ def _create_sl1_from_pngs(slices_dir: str, params_obj: Dict[str, Any], output_pa
             for i, png_file in enumerate(png_files):
                 zf.write(png_file, f"{i:05d}.png")
             
-            layer_height = params_obj.get('layer_height_mm', 0.05)
-            bottom_layers = params_obj.get('bottom_layers', 5)
-            normal_exp = params_obj.get('normal_exposure_s', 2.5)
+            # Extract parameters with proper defaults
+            layer_height = params_obj.get('layer_height_mm', 0.1)
+            bottom_layers = params_obj.get('bottom_layers', 6)
+            normal_exp = params_obj.get('normal_exposure_s', 3.0)
             bottom_exp = params_obj.get('bottom_exposure_s', 20.0)
             
+            # Motion parameters (critical for CTB)
+            lift_height = params_obj.get('lift_height_mm', 0.1)
+            lift_speed = params_obj.get('lift_speed_mm_s', 0.05)
+            retract_speed = params_obj.get('retract_speed_mm_s', 0.05)
+            bottom_lift_height = params_obj.get('bottom_lift_height_mm', 0.1)
+            bottom_lift_speed = params_obj.get('bottom_lift_speed_mm_s', 0.05)
+            
+            # Rest times
+            rest_after_lift = params_obj.get('rest_time_after_lift_s', 0.2)
+            rest_after_retract = params_obj.get('rest_time_after_retract_s', 0.8)
+            rest_before_lift = params_obj.get('rest_time_before_lift_s', 0.2)
+            
+            # PWM values
+            light_pwm = params_obj.get('light_pwm', 255)
+            bottom_light_pwm = params_obj.get('bottom_light_pwm', 255)
+            
+            # Machine name (CRITICAL)
+            machine_name = params_obj.get('machine_name', 'ELEGOO Saturn 4 Ultra')
+            
+            # Create prusaslicer.ini with full metadata
             prusaslicer_ini = f"""expTime = {normal_exp}
 expTimeFirst = {bottom_exp}
 fileCreationTimestamp = 2024-01-01 at 12:00:00 UTC
@@ -363,12 +384,13 @@ numFade = 0
 numFast = {len(png_files) - bottom_layers}
 numSlow = {bottom_layers}
 printTime = 0
-printerModel = SL1
+printerModel = {machine_name}
 printerVariant = default
 printProfile = default
 """
             zf.writestr("prusaslicer.ini", prusaslicer_ini)
             
+            # Create config.ini with extended metadata for CTB conversion
             config_ini = f"""[general]
 fileVersion = 1
 jobDir = job1
@@ -376,7 +398,7 @@ layerHeight = {layer_height}
 initialLayerCount = {bottom_layers}
 printTime = 0
 materialName = Generic
-printerModel = SL1
+printerModel = {machine_name}
 printerVariant = default
 printProfile = default
 materialProfile = default
@@ -385,6 +407,16 @@ numSlow = {bottom_layers}
 numFast = {len(png_files) - bottom_layers}
 expTime = {normal_exp}
 expTimeFirst = {bottom_exp}
+liftHeight = {lift_height}
+liftSpeed = {lift_speed}
+retractSpeed = {retract_speed}
+bottomLiftHeight = {bottom_lift_height}
+bottomLiftSpeed = {bottom_lift_speed}
+restTimeAfterLift = {rest_after_lift}
+restTimeAfterRetract = {rest_after_retract}
+restTimeBeforeLift = {rest_before_lift}
+lightPWM = {light_pwm}
+bottomLightPWM = {bottom_light_pwm}
 """
             zf.writestr("config.ini", config_ini)
         return True
