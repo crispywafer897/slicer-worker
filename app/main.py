@@ -348,32 +348,26 @@ def _create_sl1_from_pngs(slices_dir: str, params_obj: Dict[str, Any], output_pa
             for i, png_file in enumerate(png_files):
                 zf.write(png_file, f"{i:05d}.png")
             
-            # Extract parameters with proper defaults
             layer_height = params_obj.get('layer_height_mm', 0.1)
             bottom_layers = params_obj.get('bottom_layers', 6)
             normal_exp = params_obj.get('normal_exposure_s', 3.0)
             bottom_exp = params_obj.get('bottom_exposure_s', 20.0)
             
-            # Motion parameters (critical for CTB)
             lift_height = params_obj.get('lift_height_mm', 0.1)
             lift_speed = params_obj.get('lift_speed_mm_s', 0.05)
             retract_speed = params_obj.get('retract_speed_mm_s', 0.05)
             bottom_lift_height = params_obj.get('bottom_lift_height_mm', 0.1)
             bottom_lift_speed = params_obj.get('bottom_lift_speed_mm_s', 0.05)
             
-            # Rest times
             rest_after_lift = params_obj.get('rest_time_after_lift_s', 0.2)
             rest_after_retract = params_obj.get('rest_time_after_retract_s', 0.8)
             rest_before_lift = params_obj.get('rest_time_before_lift_s', 0.2)
             
-            # PWM values
             light_pwm = params_obj.get('light_pwm', 255)
             bottom_light_pwm = params_obj.get('bottom_light_pwm', 255)
             
-            # Machine name (CRITICAL)
             machine_name = params_obj.get('machine_name', 'ELEGOO Saturn 4 Ultra')
             
-            # Create prusaslicer.ini with full metadata
             prusaslicer_ini = f"""expTime = {normal_exp}
 expTimeFirst = {bottom_exp}
 fileCreationTimestamp = 2024-01-01 at 12:00:00 UTC
@@ -390,7 +384,6 @@ printProfile = default
 """
             zf.writestr("prusaslicer.ini", prusaslicer_ini)
             
-            # Create config.ini with extended metadata for CTB conversion
             config_ini = f"""[general]
 fileVersion = 1
 jobDir = job1
@@ -585,7 +578,6 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             file_prefix = f"{original_stem}_{job_id}_{timestamp}"
             log.info(f"File prefix for outputs: {file_prefix}")
-            
             printer_id_raw = job.get("printer_id", "")
             if not printer_id_raw:
                 update_job(job_id, status="failed", error="missing printer_id")
@@ -820,51 +812,61 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             log.info(f"UVtools conversion completed in {uvtools_elapsed:.1f}s with rc={rc2}")
 
             conversion_succeeded = (
-            Path(native_path).exists() and
-            Path(native_path).stat().st_size > 0 and
-            "Done" in (log2 or "")
+                Path(native_path).exists() and
+                Path(native_path).stat().st_size > 0 and
+                "Done" in (log2 or "")
             )
 
             if not conversion_succeeded:
                 update_job(job_id, status="failed", error=f"uvtools_convert_failed rc={rc2}\n{(log2 or '')[-4000:]}")
                 return {"ok": False, "error": "uvtools_convert_failed"}
 
-            log.info(f"UVtools conversion succeeded, now applying printer-specific parameters")
+            log.info(f"UVtools conversion succeeded: {native_path} ({Path(native_path).stat().st_size} bytes)")
+            log.info("Now applying printer-specific parameters via set-properties")
 
-            # Apply printer-specific parameters via property modification
+            # Apply printer-specific parameters to the CTB
             machine_name = params_obj.get('machine_name', 'ELEGOO Saturn 4 Ultra')
             lift_height = params_obj.get('lift_height_mm', 0.1)
             lift_speed = params_obj.get('lift_speed_mm_s', 0.05)
             retract_speed = params_obj.get('retract_speed_mm_s', 0.05)
             bottom_lift_height = params_obj.get('bottom_lift_height_mm', 0.1)
             bottom_lift_speed = params_obj.get('bottom_lift_speed_mm_s', 0.05)
+            bottom_retract_speed = params_obj.get('bottom_retract_speed_mm_s', 0.05)
             bottom_layers = params_obj.get('bottom_layers', 6)
+            rest_after_lift = params_obj.get('rest_time_after_lift_s', 0.2)
+            rest_after_retract = params_obj.get('rest_time_after_retract_s', 0.8)
+            rest_before_lift = params_obj.get('rest_time_before_lift_s', 0.2)
 
-            # Build property modification command
-            # UVtools CLI syntax: uvtools-cli set-property <file> <property> <value>
-            prop_cmds = [
-                f"uvtools-cli set-property {shlex.quote(native_path)} MachineName {shlex.quote(machine_name)}",
-                f"uvtools-cli set-property {shlex.quote(native_path)} LiftHeight {lift_height}",
-                f"uvtools-cli set-property {shlex.quote(native_path)} LiftSpeed {lift_speed}",
-                f"uvtools-cli set-property {shlex.quote(native_path)} RetractSpeed {retract_speed}",
-                f"uvtools-cli set-property {shlex.quote(native_path)} BottomLiftHeight {bottom_lift_height}",
-                f"uvtools-cli set-property {shlex.quote(native_path)} BottomLiftSpeed {bottom_lift_speed}",
-                f"uvtools-cli set-property {shlex.quote(native_path)} BottomLayersCount {bottom_layers}",
+            # Build all property assignments as key=value pairs
+            properties = [
+                f"MachineName={machine_name}",
+                f"LiftHeight={lift_height}",
+                f"LiftSpeed={lift_speed}",
+                f"RetractSpeed={retract_speed}",
+                f"BottomLiftHeight={bottom_lift_height}",
+                f"BottomLiftSpeed={bottom_lift_speed}",
+                f"BottomRetractSpeed={bottom_retract_speed}",
+                f"BottomLayersCount={bottom_layers}",
+                f"RestTimeAfterLift={rest_after_lift}",
+                f"RestTimeAfterRetract={rest_after_retract}",
+                f"RestTimeBeforeLift={rest_before_lift}",
             ]
 
-            log.info(f"Applying {len(prop_cmds)} property modifications to CTB")
-            for prop_cmd in prop_cmds:
-                rc_prop, log_prop = sh(prop_cmd, timeout=60)
-                if rc_prop != 0:
-                    log.warning(f"Property modification failed (rc={rc_prop}): {prop_cmd}")
-                    log.warning(f"Output: {log_prop[:500]}")
+            # UVtools set-properties accepts multiple property=value pairs in one command
+            props_str = " ".join(shlex.quote(p) for p in properties)
+            set_props_cmd = f"uvtools-cli set-properties {shlex.quote(native_path)} {props_str}"
 
-            log.info(f"CTB parameter application complete")
-            
-            if not conversion_succeeded:
-                update_job(job_id, status="failed", error=f"uvtools_convert_failed rc={rc2}\n{(log2 or '')[-4000:]}")
-                return {"ok": False, "error": "uvtools_convert_failed"}
-            log.info(f"UVtools conversion succeeded: {native_path} ({Path(native_path).stat().st_size} bytes)")
+            log.info(f"Running: uvtools-cli set-properties with {len(properties)} properties")
+            rc_props, log_props = sh(set_props_cmd, timeout=120)
+
+            if rc_props != 0:
+                log.warning(f"set-properties returned rc={rc_props}")
+                log.warning(f"Output: {log_props[-1000:]}")
+                # Don't fail the job - the file might still work
+            else:
+                log.info(f"Successfully applied printer parameters to CTB")
+
+            log.info(f"Final CTB ready at: {native_path}")
             
             log.info("Cleaning up intermediate files to free memory before uploads")
             if os.path.exists(temp_sl1):
