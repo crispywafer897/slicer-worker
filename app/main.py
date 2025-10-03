@@ -755,18 +755,18 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 return {"ok": False, "error": "sl1_creation_failed"}
             
             if target_format == "ctb" and ctb_version:
-                cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} ctb {shlex.quote(native_path)} --version {ctb_version}"
-                log.info(f"Using CTB format with explicit version: {ctb_version}")
+                cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} Chitubox {shlex.quote(native_path)} --version {ctb_version}"
+                log.info(f"Using Chitubox encoder with explicit version: {ctb_version}")
             else:
                 encoder_map = {
-                    "ctb": "ctb",
-                    "cbddlp": "cbddlp",
-                    "photon": "photon",
-                    "phz": "phz",
-                    "pws": "pws",
-                    "pwmx": "pwmx",
-                    "sl1": "sl1",
-                    "sl1s": "sl1s",
+                    "ctb": "Chitubox",
+                    "cbddlp": "Chitubox",
+                    "photon": "Chitubox",
+                    "phz": "PHZ",
+                    "pws": "Anycubic",
+                    "pwmx": "Anycubic",
+                    "sl1": "SL1",
+                    "sl1s": "SL1",
                 }
                 encoder_name = encoder_map.get(target_format, "ctb")
                 cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {encoder_name} {shlex.quote(native_path)}"
