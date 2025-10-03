@@ -1,4 +1,4 @@
-import os, subprocess, shutil, json, tempfile, zipfile, urllib.request, glob, shlex, hashlib, textwrap, re, time, base64, logging
+import os, subprocess, shutil, json, tempfile, zipfile, urllib.request, glob, shlex, hashlib, textwrap, re, time, base64, logging, struct
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple, List
 
@@ -417,6 +417,98 @@ bottomLightPWM = {bottom_light_pwm}
         log.error(f"Failed to create SL1: {e}")
         return False
 
+def patch_ctb_binary(ctb_path: str, params: Dict[str, Any]) -> bool:
+    """
+    Directly modify CTB v5 binary file to set machine parameters.
+    This is necessary because UVtools CLI commands cannot set these values.
+    """
+    try:
+        # Read the entire CTB file
+        with open(ctb_path, 'rb') as f:
+            data = bytearray(f.read())
+        
+        log.info(f"Patching CTB binary: {len(data)} bytes")
+        
+        # CTB v5 structure offsets (based on documented format)
+        # These are fixed positions in the file header
+        
+        # Verify magic number
+        magic = struct.unpack('<I', data[0:4])[0]
+        if magic != 318570630:  # CTB magic number
+            log.error(f"Invalid CTB magic number: {magic}")
+            return False
+        
+        version = struct.unpack('<I', data[4:8])[0]
+        log.info(f"CTB version: {version}")
+        
+        # Get PrintParameters offset from header (offset 100 in CTB v5)
+        print_params_offset = struct.unpack('<I', data[100:104])[0]
+        log.info(f"PrintParameters section at offset: {print_params_offset}")
+        
+        # Patch lift/retract speeds in PrintParameters section
+        # Offsets within PrintParameters (documented CTB v5 structure):
+        # +0: BottomLiftHeight (float)
+        # +4: BottomLiftSpeed (float)
+        # +8: LiftHeight (float)
+        # +12: LiftSpeed (float)
+        # +16: RetractSpeed (float)
+        
+        bottom_lift_height = float(params.get('bottom_lift_height_mm', 0.1))
+        bottom_lift_speed = float(params.get('bottom_lift_speed_mm_s', 0.05))
+        lift_height = float(params.get('lift_height_mm', 0.1))
+        lift_speed = float(params.get('lift_speed_mm_s', 0.05))
+        retract_speed = float(params.get('retract_speed_mm_s', 0.05))
+        
+        struct.pack_into('<f', data, print_params_offset + 0, bottom_lift_height)
+        struct.pack_into('<f', data, print_params_offset + 4, bottom_lift_speed)
+        struct.pack_into('<f', data, print_params_offset + 8, lift_height)
+        struct.pack_into('<f', data, print_params_offset + 12, lift_speed)
+        struct.pack_into('<f', data, print_params_offset + 16, retract_speed)
+        
+        log.info(f"Patched lift parameters: BLH={bottom_lift_height}, BLS={bottom_lift_speed}, LH={lift_height}, LS={lift_speed}, RS={retract_speed}")
+        
+        # Get SlicerInfo offset (offset 104 in header)
+        slicer_offset = struct.unpack('<I', data[104:108])[0]
+        log.info(f"SlicerInfo section at offset: {slicer_offset}")
+        
+        # Machine name is stored at an address specified in SlicerInfo
+        # MachineNameAddress is at offset +16 in SlicerInfo
+        machine_name_addr = struct.unpack('<I', data[slicer_offset + 16:slicer_offset + 20])[0]
+        machine_name_size = struct.unpack('<I', data[slicer_offset + 20:slicer_offset + 24])[0]
+        
+        log.info(f"MachineName at offset {machine_name_addr}, size {machine_name_size}")
+        
+        # Replace machine name
+        machine_name = params.get('machine_name', 'ELEGOO Saturn 4 Ultra')
+        machine_name_bytes = machine_name.encode('utf-8')
+        
+        # Write new machine name and update size
+        if machine_name_addr > 0 and machine_name_addr < len(data):
+            # Clear old name area (write zeros)
+            for i in range(machine_name_size):
+                data[machine_name_addr + i] = 0
+            
+            # Write new name
+            data[machine_name_addr:machine_name_addr + len(machine_name_bytes)] = machine_name_bytes
+            
+            # Update size in SlicerInfo
+            struct.pack_into('<I', data, slicer_offset + 20, len(machine_name_bytes))
+            
+            log.info(f"Patched MachineName to: {machine_name}")
+        
+        # Write patched data back
+        with open(ctb_path, 'wb') as f:
+            f.write(data)
+        
+        log.info(f"Successfully patched CTB binary")
+        return True
+        
+    except Exception as e:
+        log.error(f"Binary patching failed: {e}")
+        import traceback
+        log.error(traceback.format_exc())
+        return False
+
 def uvtools_version() -> Tuple[int, str]:
     if not _has_uvtools():
         return (127, "uvtools-cli not found on PATH")
@@ -583,6 +675,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             timestamp = time.strftime("%Y%m%d_%H%M%S")
             file_prefix = f"{original_stem}_{job_id}_{timestamp}"
             log.info(f"File prefix for outputs: {file_prefix}")
+            
             printer_id_raw = job.get("printer_id", "")
             if not printer_id_raw:
                 update_job(job_id, status="failed", error="missing printer_id")
@@ -827,32 +920,15 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 return {"ok": False, "error": "uvtools_convert_failed"}
 
             log.info(f"UVtools conversion succeeded: {native_path} ({Path(native_path).stat().st_size} bytes)")
-            log.info("Now copying print parameters from reference CTB")
+            log.info("Applying binary patches to set printer parameters")
 
-            # Download reference CTB from storage
-            reference_ctb_path = "reference_files/elegoo_saturn4_ultra_reference.ctb"
-            reference_local = os.path.join(wd, "reference.ctb")
+            # Use binary patching to directly modify CTB values
+            if not patch_ctb_binary(native_path, params_obj):
+                log.error("Binary patching failed")
+                update_job(job_id, status="failed", error="ctb_binary_patch_failed")
+                return {"ok": False, "error": "ctb_binary_patch_failed"}
 
-            try:
-                _download_storage(reference_ctb_path, Path(reference_local))
-                log.info(f"Downloaded reference CTB: {reference_local}")
-    
-                # Copy parameters from reference to our generated CTB
-                copy_cmd = f"uvtools-cli copy-parameters {shlex.quote(reference_local)} {shlex.quote(native_path)}"
-                log.info(f"Running: {copy_cmd}")
-                rc_copy, log_copy = sh(copy_cmd, timeout=120)
-    
-                if rc_copy != 0:
-                    log.warning(f"copy-parameters returned rc={rc_copy}")
-                    log.warning(f"Output: {log_copy[-1000:]}")
-                    # Don't fail the job - the file might still work
-                else:
-                    log.info(f"Successfully copied printer parameters from reference CTB")
-            except Exception as e:
-                log.warning(f"Failed to copy parameters from reference: {e}")
-                # Continue anyway - better to have a file with wrong params than no file
-
-            log.info(f"Final CTB ready at: {native_path}")
+            log.info(f"Binary patching complete, final CTB ready at: {native_path}")
             
             log.info("Cleaning up intermediate files to free memory before uploads")
             if os.path.exists(temp_sl1):
