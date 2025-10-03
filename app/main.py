@@ -511,6 +511,11 @@ def diag_uvtools_help():
         "rc": rc,
         "help_output": output
     }
+
+@app.get("/diag/convert-help")
+def diag_convert_help():
+    rc, output = sh("uvtools-cli convert --help", timeout=30)
+    return {"rc": rc, "help": output}
     
 @app.get("/diag/encoders")
 def diag_encoders():
