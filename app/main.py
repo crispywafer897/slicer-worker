@@ -511,6 +511,14 @@ def diag_uvtools():
         "synthetic_pack_result": (log_p or "")[-1200:],
     }
 
+@app.get("/diag/uvtools-help")
+def diag_uvtools_help():
+    rc, output = sh("uvtools-cli --help", timeout=30)
+    return {
+        "rc": rc,
+        "help_output": output
+    }
+    
 @app.get("/diag/encoders")
 def diag_encoders():
     rc, output = sh("uvtools-cli convert --help", timeout=30)
@@ -803,19 +811,56 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 encoder_name = encoder_map.get(target_format, "ctb")
                 cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {encoder_name} {shlex.quote(native_path)}"
                 log.info(f"Using encoder: {encoder_name} for format: {target_format}")
-            
-            log.info(f"UVtools command: {cmd2}")
+
+            log.info(f"UVtools convert command: {cmd2}")
             log.info(f"Starting UVtools conversion at {time.strftime('%Y-%m-%d %H:%M:%S')}")
             uvtools_start = time.time()
             rc2, log2 = sh(cmd2, timeout=1800)
             uvtools_elapsed = time.time() - uvtools_start
             log.info(f"UVtools conversion completed in {uvtools_elapsed:.1f}s with rc={rc2}")
-            
+
             conversion_succeeded = (
-                Path(native_path).exists() and
-                Path(native_path).stat().st_size > 0 and
-                "Done" in (log2 or "")
+            Path(native_path).exists() and
+            Path(native_path).stat().st_size > 0 and
+            "Done" in (log2 or "")
             )
+
+            if not conversion_succeeded:
+                update_job(job_id, status="failed", error=f"uvtools_convert_failed rc={rc2}\n{(log2 or '')[-4000:]}")
+                return {"ok": False, "error": "uvtools_convert_failed"}
+
+            log.info(f"UVtools conversion succeeded, now applying printer-specific parameters")
+
+            # Apply printer-specific parameters via property modification
+            machine_name = params_obj.get('machine_name', 'ELEGOO Saturn 4 Ultra')
+            lift_height = params_obj.get('lift_height_mm', 0.1)
+            lift_speed = params_obj.get('lift_speed_mm_s', 0.05)
+            retract_speed = params_obj.get('retract_speed_mm_s', 0.05)
+            bottom_lift_height = params_obj.get('bottom_lift_height_mm', 0.1)
+            bottom_lift_speed = params_obj.get('bottom_lift_speed_mm_s', 0.05)
+            bottom_layers = params_obj.get('bottom_layers', 6)
+
+            # Build property modification command
+            # UVtools CLI syntax: uvtools-cli set-property <file> <property> <value>
+            prop_cmds = [
+                f"uvtools-cli set-property {shlex.quote(native_path)} MachineName {shlex.quote(machine_name)}",
+                f"uvtools-cli set-property {shlex.quote(native_path)} LiftHeight {lift_height}",
+                f"uvtools-cli set-property {shlex.quote(native_path)} LiftSpeed {lift_speed}",
+                f"uvtools-cli set-property {shlex.quote(native_path)} RetractSpeed {retract_speed}",
+                f"uvtools-cli set-property {shlex.quote(native_path)} BottomLiftHeight {bottom_lift_height}",
+                f"uvtools-cli set-property {shlex.quote(native_path)} BottomLiftSpeed {bottom_lift_speed}",
+                f"uvtools-cli set-property {shlex.quote(native_path)} BottomLayersCount {bottom_layers}",
+            ]
+
+            log.info(f"Applying {len(prop_cmds)} property modifications to CTB")
+            for prop_cmd in prop_cmds:
+                rc_prop, log_prop = sh(prop_cmd, timeout=60)
+                if rc_prop != 0:
+                    log.warning(f"Property modification failed (rc={rc_prop}): {prop_cmd}")
+                    log.warning(f"Output: {log_prop[:500]}")
+
+            log.info(f"CTB parameter application complete")
+            
             if not conversion_succeeded:
                 update_job(job_id, status="failed", error=f"uvtools_convert_failed rc={rc2}\n{(log2 or '')[-4000:]}")
                 return {"ok": False, "error": "uvtools_convert_failed"}
