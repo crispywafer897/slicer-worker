@@ -203,8 +203,23 @@ def _sha256(path: Path) -> str:
 
 def _download_storage(object_path: str, dest: Path):
     dest.parent.mkdir(parents=True, exist_ok=True)
-    data = _supabase().storage.from_(STORAGE_BUCKET).download(object_path)
-    dest.write_bytes(data)
+    try:
+        # Try direct download first
+        data = _supabase().storage.from_(STORAGE_BUCKET).download(object_path)
+        dest.write_bytes(data)
+        log.info(f"Downloaded {object_path} via direct method")
+    except Exception as e:
+        log.warning(f"Direct download failed for {object_path}: {e}, trying signed URL")
+        # Fallback to signed URL approach
+        res = _supabase().storage.from_(STORAGE_BUCKET).create_signed_url(object_path, 3600)
+        signed = res.get("signedURL") or res.get("signed_url")
+        if not signed:
+            raise RuntimeError(f"Could not create signed URL for {STORAGE_BUCKET}:{object_path}")
+        url = signed if signed.startswith("http") else SUPABASE_URL.rstrip("/") + signed
+        log.info(f"Downloading {object_path} from signed URL")
+        with urllib.request.urlopen(url) as r:
+            dest.write_bytes(r.read())
+        log.info(f"Downloaded {object_path} via signed URL")
 
 def resolve_preset(printer_id: str) -> Dict[str, Any]:
     res = _supabase().table("printer_presets").select("*").eq("id", printer_id).single().execute()
