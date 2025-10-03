@@ -827,49 +827,30 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 return {"ok": False, "error": "uvtools_convert_failed"}
 
             log.info(f"UVtools conversion succeeded: {native_path} ({Path(native_path).stat().st_size} bytes)")
-            log.info("Now applying printer-specific parameters via set-properties")
+            log.info("Now copying print parameters from reference CTB")
 
-            # Apply printer-specific parameters to the CTB
-            machine_name = params_obj.get('machine_name', 'ELEGOO Saturn 4 Ultra')
-            lift_height = params_obj.get('lift_height_mm', 0.1)
-            lift_speed = params_obj.get('lift_speed_mm_s', 0.05)
-            retract_speed = params_obj.get('retract_speed_mm_s', 0.05)
-            bottom_lift_height = params_obj.get('bottom_lift_height_mm', 0.1)
-            bottom_lift_speed = params_obj.get('bottom_lift_speed_mm_s', 0.05)
-            bottom_retract_speed = params_obj.get('bottom_retract_speed_mm_s', 0.05)
-            bottom_layers = params_obj.get('bottom_layers', 6)
-            rest_after_lift = params_obj.get('rest_time_after_lift_s', 0.2)
-            rest_after_retract = params_obj.get('rest_time_after_retract_s', 0.8)
-            rest_before_lift = params_obj.get('rest_time_before_lift_s', 0.2)
+            # Download reference CTB from storage
+            reference_ctb_path = "reference_files/elegoo_saturn4_ultra_reference.ctb"
+            reference_local = os.path.join(wd, "reference.ctb")
 
-            # Build all property assignments as key=value pairs
-            properties = [
-                f"MachineName={machine_name}",
-                f"LiftHeight={lift_height}",
-                f"LiftSpeed={lift_speed}",
-                f"RetractSpeed={retract_speed}",
-                f"BottomLiftHeight={bottom_lift_height}",
-                f"BottomLiftSpeed={bottom_lift_speed}",
-                f"BottomRetractSpeed={bottom_retract_speed}",
-                f"BottomLayersCount={bottom_layers}",
-                f"RestTimeAfterLift={rest_after_lift}",
-                f"RestTimeAfterRetract={rest_after_retract}",
-                f"RestTimeBeforeLift={rest_before_lift}",
-            ]
-
-            # UVtools set-properties accepts multiple property=value pairs in one command
-            props_str = " ".join(shlex.quote(p) for p in properties)
-            set_props_cmd = f"uvtools-cli set-properties {shlex.quote(native_path)} {props_str}"
-
-            log.info(f"Running: uvtools-cli set-properties with {len(properties)} properties")
-            rc_props, log_props = sh(set_props_cmd, timeout=120)
-
-            if rc_props != 0:
-                log.warning(f"set-properties returned rc={rc_props}")
-                log.warning(f"Output: {log_props[-1000:]}")
-                # Don't fail the job - the file might still work
-            else:
-                log.info(f"Successfully applied printer parameters to CTB")
+            try:
+                _download_storage(reference_ctb_path, Path(reference_local))
+                log.info(f"Downloaded reference CTB: {reference_local}")
+    
+                # Copy parameters from reference to our generated CTB
+                copy_cmd = f"uvtools-cli copy-parameters {shlex.quote(reference_local)} {shlex.quote(native_path)}"
+                log.info(f"Running: {copy_cmd}")
+                rc_copy, log_copy = sh(copy_cmd, timeout=120)
+    
+                if rc_copy != 0:
+                    log.warning(f"copy-parameters returned rc={rc_copy}")
+                    log.warning(f"Output: {log_copy[-1000:]}")
+                    # Don't fail the job - the file might still work
+                else:
+                    log.info(f"Successfully copied printer parameters from reference CTB")
+            except Exception as e:
+                log.warning(f"Failed to copy parameters from reference: {e}")
+                # Continue anyway - better to have a file with wrong params than no file
 
             log.info(f"Final CTB ready at: {native_path}")
             
