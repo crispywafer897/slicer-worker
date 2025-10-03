@@ -435,7 +435,15 @@ def patch_ctb_binary(ctb_path: str, params: Dict[str, Any]) -> bool:
             return False
         
         version = struct.unpack('<I', data[4:8])[0]
-        log.info(f"CTB version field: {version}")
+        log.info(f"CTB version field before conversion: {version}, magic: {magic}")
+        
+        # Force CTB v4 magic number if printer expects it
+        if magic == 318570630:  # v5 magic
+            log.info("Converting CTB v5 magic to v4 for compatibility")
+            struct.pack_into('<I', data, 0, 318570759)  # v4 magic
+            # Also set version to 288 (v4 version field)
+            struct.pack_into('<I', data, 4, 288)
+            log.info("Converted to CTB v4 format (magic: 318570759, version: 288)")
         
         # Correct header offsets from 010 Editor template:
         # Offset 84: PrintParametersOffsetAddress
