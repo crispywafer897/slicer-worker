@@ -419,40 +419,39 @@ bottomLightPWM = {bottom_light_pwm}
 
 def patch_ctb_binary(ctb_path: str, params: Dict[str, Any]) -> bool:
     """
-    Directly modify CTB v5 binary file to set machine parameters.
-    This is necessary because UVtools CLI commands cannot set these values.
+    Directly modify CTB v4/v5 binary file to set machine parameters.
+    Uses the correct header structure from UVtools 010 Editor template.
     """
     try:
-        # Read the entire CTB file
         with open(ctb_path, 'rb') as f:
             data = bytearray(f.read())
         
         log.info(f"Patching CTB binary: {len(data)} bytes")
         
-        # Verify magic number
+        # Verify magic number (either v4 or v5)
         magic = struct.unpack('<I', data[0:4])[0]
-        if magic != 318570630:  # CTB magic number
+        if magic not in (318570759, 318570630):  # v4 or v5
             log.error(f"Invalid CTB magic number: {magic}")
             return False
         
         version = struct.unpack('<I', data[4:8])[0]
-        log.info(f"CTB version: {version}")
+        log.info(f"CTB version field: {version}")
         
-        # CTB v5 header structure (corrected based on actual format):
-        # Offset 60: PrintParametersOffsetAddress (uint32)
-        # Offset 64: PrintParametersSize (uint32)
+        # Correct header offsets from 010 Editor template:
+        # Offset 84: PrintParametersOffsetAddress
+        # Offset 104: SlicerOffset
         
-        print_params_offset = struct.unpack('<I', data[60:64])[0]
-        print_params_size = struct.unpack('<I', data[64:68])[0]
+        print_params_offset = struct.unpack('<I', data[84:88])[0]
+        print_params_size = struct.unpack('<I', data[88:92])[0]
         log.info(f"PrintParameters at offset: {print_params_offset}, size: {print_params_size}")
         
         if print_params_offset <= 0 or print_params_offset >= len(data):
             log.error(f"Invalid PrintParameters offset: {print_params_offset}")
             return False
         
-        # PrintParameters structure (60 bytes total):
+        # PRINT_PARAMETERS structure:
         # +0: BottomLiftHeight (float)
-        # +4: BottomLiftSpeed (float)  
+        # +4: BottomLiftSpeed (float)
         # +8: LiftHeight (float)
         # +12: LiftSpeed (float)
         # +16: RetractSpeed (float)
@@ -471,19 +470,21 @@ def patch_ctb_binary(ctb_path: str, params: Dict[str, Any]) -> bool:
         
         log.info(f"Patched PrintParameters: BLH={bottom_lift_height}, BLS={bottom_lift_speed}, LH={lift_height}, LS={lift_speed}, RS={retract_speed}")
         
-        # SlicerInfo offset is at position 68 in header
-        slicer_offset = struct.unpack('<I', data[68:72])[0]
-        slicer_size = struct.unpack('<I', data[72:76])[0]
+        # SlicerInfo offset
+        slicer_offset = struct.unpack('<I', data[104:108])[0]
+        slicer_size = struct.unpack('<I', data[108:112])[0]
         log.info(f"SlicerInfo at offset: {slicer_offset}, size: {slicer_size}")
         
         if slicer_offset <= 0 or slicer_offset >= len(data):
             log.error(f"Invalid SlicerInfo offset: {slicer_offset}")
             return False
         
-        # MachineNameAddress is at offset +16 in SlicerInfo
-        # MachineNameSize is at offset +20 in SlicerInfo
-        machine_name_addr = struct.unpack('<I', data[slicer_offset + 16:slicer_offset + 20])[0]
-        machine_name_size = struct.unpack('<I', data[slicer_offset + 20:slicer_offset + 24])[0]
+        # SLICER_INFO structure (from template):
+        # +28 (7 floats * 4 bytes): MachineNameAddress (uint)
+        # +32: MachineNameSize (uint)
+        
+        machine_name_addr = struct.unpack('<I', data[slicer_offset + 28:slicer_offset + 32])[0]
+        machine_name_size = struct.unpack('<I', data[slicer_offset + 32:slicer_offset + 36])[0]
         
         log.info(f"MachineName at offset {machine_name_addr}, current size {machine_name_size}")
         
@@ -493,8 +494,8 @@ def patch_ctb_binary(ctb_path: str, params: Dict[str, Any]) -> bool:
         
         if machine_name_addr > 0 and machine_name_addr < len(data):
             # Clear old name area
-            if machine_name_size > 0:
-                for i in range(min(machine_name_size, len(data) - machine_name_addr)):
+            if machine_name_size > 0 and machine_name_addr + machine_name_size <= len(data):
+                for i in range(machine_name_size):
                     data[machine_name_addr + i] = 0
             
             # Write new name
@@ -502,11 +503,11 @@ def patch_ctb_binary(ctb_path: str, params: Dict[str, Any]) -> bool:
             data[machine_name_addr:machine_name_addr + new_size] = machine_name_bytes[:new_size]
             
             # Update size in SlicerInfo
-            struct.pack_into('<I', data, slicer_offset + 20, new_size)
+            struct.pack_into('<I', data, slicer_offset + 32, new_size)
             
             log.info(f"Patched MachineName to: {machine_name} ({new_size} bytes)")
         else:
-            log.warning(f"MachineName address invalid or zero, skipping")
+            log.warning(f"MachineName address invalid ({machine_name_addr}), skipping")
         
         # Write patched data back
         with open(ctb_path, 'wb') as f:
