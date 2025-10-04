@@ -823,17 +823,10 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 expected_native = str(row.get("native_format", "")).lower()
                 
                 if found_ext in ("sl1", "sl1s") and found_ext != expected_native:
-                    log.info(f"Found {found_ext} file, extracting PNGs to convert to {expected_native}")
-                    extract_dir = os.path.join(out_dir, "extracted_sl1")
-                    os.makedirs(extract_dir, exist_ok=True)
-                    try:
-                        with zipfile.ZipFile(native_found, 'r') as z:
-                            z.extractall(extract_dir)
-                        log.info(f"Extracted .sl1 contents to {extract_dir}")
-                    except Exception as e:
-                        log.error(f"Failed to extract .sl1: {e}")
-                        update_job(job_id, status="failed", error=f"sl1_extraction_failed: {e}")
-                        return {"ok": False, "error": "sl1_extraction_failed"}
+                    log.info(f"Found {found_ext} file from PrusaSlicer, will convert directly to {expected_native}")
+                    # Don't extract and reconstruct - use PrusaSlicer's original .sl1 file directly
+                    # The original .sl1 has proper metadata that UVtools needs
+                    # We'll just pass it straight to UVtools for conversion
                 elif found_ext == expected_native and found_ext:
                     log.info(f"Native format matches expected: {found_ext}")
                     slices_dir_opt = find_layers(out_dir)
@@ -879,23 +872,51 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                     log.info("Job status update completed")
                     return {"ok": True}
             
+            # If we get here, we need to convert using UVtools
             slices_dir = None
-            for search_dir in potential_output_dirs:
-                if os.path.exists(search_dir):
-                    slices_dir = find_layers(search_dir)
-                    if slices_dir:
-                        log.info(f"Found slices in {slices_dir}")
-                        break
             
-            if not slices_dir:
-                log.error(f"No slices found. Workspace structure:")
-                for root, dirs, files in os.walk(wd):
-                    log.error(f"DIR: {root}")
-                    for f in files:
-                        log.error(f"  FILE: {os.path.join(root, f)}")
-                update_job(job_id, status="failed", error=f"no_slices_found in any output location. Searched: {', '.join(potential_output_dirs)}")
-                return {"ok": False, "error": "no_slices_found"}
+            # Check if we already have an SL1 from PrusaSlicer
+            native_found = find_native_artifact(out_dir)
+            if native_found and Path(native_found).suffix.lstrip(".").lower() in ("sl1", "sl1s"):
+                # Use PrusaSlicer's original .sl1 directly - it has proper metadata
+                log.info(f"Using PrusaSlicer's original .sl1 file for conversion")
+                temp_sl1 = native_found
+                
+                # Also extract PNGs for the layers ZIP
+                extract_dir = os.path.join(out_dir, "extracted_sl1")
+                os.makedirs(extract_dir, exist_ok=True)
+                with zipfile.ZipFile(native_found, 'r') as z:
+                    z.extractall(extract_dir)
+                slices_dir = find_layers(extract_dir)
+            else:
+                # No .sl1 from PrusaSlicer, look for loose PNGs
+                for search_dir in potential_output_dirs:
+                    if os.path.exists(search_dir):
+                        slices_dir = find_layers(search_dir)
+                        if slices_dir:
+                            log.info(f"Found slices in {slices_dir}")
+                            break
+                
+                if not slices_dir:
+                    log.error(f"No slices found. Workspace structure:")
+                    for root, dirs, files in os.walk(wd):
+                        log.error(f"DIR: {root}")
+                        for f in files:
+                            log.error(f"  FILE: {os.path.join(root, f)}")
+                    update_job(job_id, status="failed", error=f"no_slices_found in any output location. Searched: {', '.join(potential_output_dirs)}")
+                    return {"ok": False, "error": "no_slices_found"}
+                
+                # Create SL1 from loose PNGs
+                merged_params_path = merge_overrides(Path(params_local), job.get("overrides"))
+                params_obj = _read_json(Path(merged_params_path))
+                
+                log.info(f"Creating SL1 from PNG layers")
+                temp_sl1 = os.path.join(out_dir, "temp_for_conversion.sl1")
+                if not _create_sl1_from_pngs(slices_dir, params_obj, temp_sl1):
+                    update_job(job_id, status="failed", error="failed to create temp SL1")
+                    return {"ok": False, "error": "sl1_creation_failed"}
             
+            # Get params for conversion
             merged_params_path = merge_overrides(Path(params_local), job.get("overrides"))
             params_obj = _read_json(Path(merged_params_path))
             
@@ -913,14 +934,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 update_job(job_id, status="failed", error=f"uvtools_params_invalid: {params_err}")
                 return {"ok": False, "error": "uvtools_params_invalid"}
             
-            # Always use UVtools to create CTB from PNGs, then optionally patch
-            log.info(f"Creating {target_format.upper()} from PNG layers using UVtools")
-            
-            temp_sl1 = os.path.join(out_dir, "temp_for_conversion.sl1")
-            if not _create_sl1_from_pngs(slices_dir, params_obj, temp_sl1):
-                update_job(job_id, status="failed", error="failed to create temp SL1")
-                return {"ok": False, "error": "sl1_creation_failed"}
-            
+            # Convert to target format using UVtools
             ctb_version = params_obj.get("ctb_version", 4)
             
             if target_format == "ctb":
@@ -968,12 +982,13 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 else:
                     log.info(f"Binary patching complete")
             
-            # Clean up temp SL1
-            log.info("Cleaning up intermediate files to free memory before uploads")
-            if os.path.exists(temp_sl1):
-                temp_sl1_size = os.path.getsize(temp_sl1) / (1024 * 1024)
-                os.remove(temp_sl1)
-                log.info(f"Deleted temp SL1 file ({temp_sl1_size:.1f} MB)")
+            # Clean up temp SL1 (only if we created it, not if it's PrusaSlicer's original)
+            if temp_sl1 != native_found:
+                log.info("Cleaning up intermediate files to free memory before uploads")
+                if os.path.exists(temp_sl1):
+                    temp_sl1_size = os.path.getsize(temp_sl1) / (1024 * 1024)
+                    os.remove(temp_sl1)
+                    log.info(f"Deleted temp SL1 file ({temp_sl1_size:.1f} MB)")
             
             # Upload all outputs
             zip_path = os.path.join(out_dir, f"{file_prefix}_layers.zip")
