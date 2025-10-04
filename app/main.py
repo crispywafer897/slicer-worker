@@ -432,59 +432,6 @@ bottomLightPWM = {bottom_light_pwm}
         log.error(f"Failed to create SL1: {e}")
         return False
 
-def hybrid_ctb_from_reference(
-    reference_ctb_path: str,
-    output_ctb_path: str,
-    params: Dict[str, Any]
-) -> bool:
-    """
-    Create a valid CTB by using a reference CTB's structure and only updating critical parameters.
-    This preserves all the complex layer encoding that ensures printer compatibility.
-    """
-    try:
-        log.info(f"Loading reference CTB: {reference_ctb_path}")
-        with open(reference_ctb_path, 'rb') as f:
-            ref_data = bytearray(f.read())
-        
-        # Verify it's a valid CTB
-        magic = struct.unpack('<I', ref_data[0:4])[0]
-        if magic not in (318570759, 318570630):  # v4 or v5
-            log.error(f"Reference file is not a valid CTB (magic={magic})")
-            return False
-        
-        log.info(f"Reference CTB is valid (magic={magic}, {len(ref_data)} bytes)")
-        
-        # Update PrintParameters if present
-        print_params_offset = struct.unpack('<I', ref_data[84:88])[0]
-        if print_params_offset > 0 and print_params_offset < len(ref_data):
-            # Convert speeds from mm/s to mm/min if needed (some params are in mm/s, CTB stores mm/min)
-            bottom_lift_height = float(params.get('bottom_lift_height_mm', 5.0))
-            bottom_lift_speed = float(params.get('bottom_lift_speed_mm_s', 65.0))
-            lift_height = float(params.get('lift_height_mm', 6.0))
-            lift_speed = float(params.get('lift_speed_mm_s', 65.0))
-            retract_speed = float(params.get('retract_speed_mm_s', 150.0))
-            
-            struct.pack_into('<f', ref_data, print_params_offset + 0, bottom_lift_height)
-            struct.pack_into('<f', ref_data, print_params_offset + 4, bottom_lift_speed)
-            struct.pack_into('<f', ref_data, print_params_offset + 8, lift_height)
-            struct.pack_into('<f', ref_data, print_params_offset + 12, lift_speed)
-            struct.pack_into('<f', ref_data, print_params_offset + 16, retract_speed)
-            
-            log.info(f"Updated PrintParameters: lift={lift_height}mm@{lift_speed}mm/s, retract={retract_speed}mm/s")
-        
-        # Write the output
-        with open(output_ctb_path, 'wb') as f:
-            f.write(ref_data)
-        
-        log.info(f"Created hybrid CTB at {output_ctb_path} ({len(ref_data)} bytes)")
-        return True
-        
-    except Exception as e:
-        log.error(f"Hybrid CTB creation failed: {e}")
-        import traceback
-        log.error(traceback.format_exc())
-        return False
-
 def patch_ctb_binary(ctb_path: str, params: Dict[str, Any]) -> bool:
     """
     Directly modify CTB v4/v5 binary file to set machine parameters.
@@ -966,96 +913,69 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 update_job(job_id, status="failed", error=f"uvtools_params_invalid: {params_err}")
                 return {"ok": False, "error": "uvtools_params_invalid"}
             
-            # Check if this printer has a reference CTB configured (hybrid approach)
-            reference_ctb_path = row.get("reference_ctb_path")
-            use_hybrid_approach = (target_format == "ctb" and reference_ctb_path)
+            # Always use UVtools to create CTB from PNGs, then optionally patch
+            log.info(f"Creating {target_format.upper()} from PNG layers using UVtools")
             
-            if use_hybrid_approach:
-                log.info(f"Using hybrid CTB approach with reference: {reference_ctb_path}")
-                
-                # Download reference CTB
-                reference_local = os.path.join(wd, "reference.ctb")
-                try:
-                    _download_storage(reference_ctb_path, Path(reference_local))
-                    log.info(f"Downloaded reference CTB: {reference_local}")
-                except Exception as e:
-                    log.error(f"Failed to download reference CTB: {e}")
-                    update_job(job_id, status="failed", error=f"reference_ctb_download_failed: {e}")
-                    return {"ok": False, "error": "reference_ctb_download_failed"}
-                
-                # Create CTB using reference as template
-                if not hybrid_ctb_from_reference(reference_local, native_path, params_obj):
-                    log.error("Hybrid CTB creation failed")
-                    update_job(job_id, status="failed", error="hybrid_ctb_creation_failed")
-                    return {"ok": False, "error": "hybrid_ctb_creation_failed"}
-                
-                log.info(f"Hybrid CTB created successfully: {native_path}")
-                
+            temp_sl1 = os.path.join(out_dir, "temp_for_conversion.sl1")
+            if not _create_sl1_from_pngs(slices_dir, params_obj, temp_sl1):
+                update_job(job_id, status="failed", error="failed to create temp SL1")
+                return {"ok": False, "error": "sl1_creation_failed"}
+            
+            ctb_version = params_obj.get("ctb_version", 4)
+            
+            if target_format == "ctb":
+                cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} Chitubox {shlex.quote(native_path)} --version {ctb_version}"
+                log.info(f"Using Chitubox encoder with explicit version: {ctb_version}")
             else:
-                log.info(f"Using standard UVtools conversion approach for format: {target_format}")
-                
-                # Standard UVtools conversion approach (for non-CTB or CTB without reference)
-                temp_sl1 = os.path.join(out_dir, "temp_for_conversion.sl1")
-                if not _create_sl1_from_pngs(slices_dir, params_obj, temp_sl1):
-                    update_job(job_id, status="failed", error="failed to create temp SL1")
-                    return {"ok": False, "error": "sl1_creation_failed"}
-                
-                ctb_version = params_obj.get("ctb_version")
-                
-                if target_format == "ctb" and ctb_version:
-                    cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} Chitubox {shlex.quote(native_path)} --version {ctb_version}"
-                    log.info(f"Using Chitubox encoder with explicit version: {ctb_version}")
-                else:
-                    encoder_map = {
-                        "ctb": "Chitubox",
-                        "cbddlp": "Chitubox",
-                        "photon": "Chitubox",
-                        "phz": "PHZ",
-                        "pws": "Anycubic",
-                        "pwmx": "Anycubic",
-                        "sl1": "SL1",
-                        "sl1s": "SL1",
-                    }
-                    encoder_name = encoder_map.get(target_format, "Chitubox")
-                    cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {encoder_name} {shlex.quote(native_path)}"
-                    log.info(f"Using encoder: {encoder_name} for format: {target_format}")
+                encoder_map = {
+                    "ctb": "Chitubox",
+                    "cbddlp": "Chitubox",
+                    "photon": "Chitubox",
+                    "phz": "PHZ",
+                    "pws": "Anycubic",
+                    "pwmx": "Anycubic",
+                    "sl1": "SL1",
+                    "sl1s": "SL1",
+                }
+                encoder_name = encoder_map.get(target_format, "Chitubox")
+                cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} {encoder_name} {shlex.quote(native_path)}"
+                log.info(f"Using encoder: {encoder_name} for format: {target_format}")
 
-                log.info(f"UVtools convert command: {cmd2}")
-                log.info(f"Starting UVtools conversion at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-                uvtools_start = time.time()
-                rc2, log2 = sh(cmd2, timeout=1800)
-                uvtools_elapsed = time.time() - uvtools_start
-                log.info(f"UVtools conversion completed in {uvtools_elapsed:.1f}s with rc={rc2}")
+            log.info(f"UVtools convert command: {cmd2}")
+            log.info(f"Starting UVtools conversion at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            uvtools_start = time.time()
+            rc2, log2 = sh(cmd2, timeout=1800)
+            uvtools_elapsed = time.time() - uvtools_start
+            log.info(f"UVtools conversion completed in {uvtools_elapsed:.1f}s with rc={rc2}")
 
-                conversion_succeeded = (
-                    Path(native_path).exists() and
-                    Path(native_path).stat().st_size > 0 and
-                    "Done" in (log2 or "")
-                )
+            conversion_succeeded = (
+                Path(native_path).exists() and
+                Path(native_path).stat().st_size > 0 and
+                "Done" in (log2 or "")
+            )
 
-                if not conversion_succeeded:
-                    update_job(job_id, status="failed", error=f"uvtools_convert_failed rc={rc2}\n{(log2 or '')[-4000:]}")
-                    return {"ok": False, "error": "uvtools_convert_failed"}
+            if not conversion_succeeded:
+                update_job(job_id, status="failed", error=f"uvtools_convert_failed rc={rc2}\n{(log2 or '')[-4000:]}")
+                return {"ok": False, "error": "uvtools_convert_failed"}
 
-                log.info(f"UVtools conversion succeeded: {native_path} ({Path(native_path).stat().st_size} bytes)")
-                
-                # Apply binary patching for CTB files
-                if target_format == "ctb":
-                    log.info("Applying binary patches to set printer parameters")
-                    if not patch_ctb_binary(native_path, params_obj):
-                        log.error("Binary patching failed")
-                        update_job(job_id, status="failed", error="ctb_binary_patch_failed")
-                        return {"ok": False, "error": "ctb_binary_patch_failed"}
-                    log.info(f"Binary patching complete, final CTB ready at: {native_path}")
-                
-                # Clean up temp SL1
-                log.info("Cleaning up intermediate files to free memory before uploads")
-                if os.path.exists(temp_sl1):
-                    temp_sl1_size = os.path.getsize(temp_sl1) / (1024 * 1024)
-                    os.remove(temp_sl1)
-                    log.info(f"Deleted temp SL1 file ({temp_sl1_size:.1f} MB)")
+            log.info(f"UVtools conversion succeeded: {native_path} ({Path(native_path).stat().st_size} bytes)")
             
-            # Common upload logic for both approaches
+            # Apply binary patching for CTB files to fix any parameters UVtools set incorrectly
+            if target_format == "ctb":
+                log.info("Applying binary patches to set correct printer parameters")
+                if not patch_ctb_binary(native_path, params_obj):
+                    log.warning("Binary patching failed, but continuing with UVtools output")
+                else:
+                    log.info(f"Binary patching complete")
+            
+            # Clean up temp SL1
+            log.info("Cleaning up intermediate files to free memory before uploads")
+            if os.path.exists(temp_sl1):
+                temp_sl1_size = os.path.getsize(temp_sl1) / (1024 * 1024)
+                os.remove(temp_sl1)
+                log.info(f"Deleted temp SL1 file ({temp_sl1_size:.1f} MB)")
+            
+            # Upload all outputs
             zip_path = os.path.join(out_dir, f"{file_prefix}_layers.zip")
             log.info(f"Creating layers ZIP at {zip_path}")
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
@@ -1081,7 +1001,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             
             report = {
                 "native_ext": native_ext, 
-                "native_source": "hybrid_ctb" if use_hybrid_approach else "uvtools",
+                "native_source": "uvtools",
                 "layers": len(glob.glob(os.path.join(slices_dir, "*.png")))
             }
             
