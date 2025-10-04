@@ -961,6 +961,11 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             rc2, log2 = sh(cmd2, timeout=1800)
             uvtools_elapsed = time.time() - uvtools_start
             log.info(f"UVtools conversion completed in {uvtools_elapsed:.1f}s with rc={rc2}")
+            # Log the FULL UVtools output to see what went wrong
+            log.info(f"=== FULL UVTOOLS OUTPUT (first 5000 chars) ===")
+            log.info(log2[:5000] if log2 else "NO OUTPUT")
+            log.info(f"=== FULL UVTOOLS OUTPUT (last 5000 chars) ===")
+            log.info(log2[-5000:] if log2 else "NO OUTPUT")
 
             conversion_succeeded = (
                 Path(native_path).exists() and
