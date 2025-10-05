@@ -432,119 +432,6 @@ bottomLightPWM = {bottom_light_pwm}
         log.error(f"Failed to create SL1: {e}")
         return False
 
-def patch_ctb_binary(ctb_path: str, params: Dict[str, Any]) -> bool:
-    """
-    Directly modify CTB v4/v5 binary file to set machine parameters.
-    Uses the correct header structure from UVtools 010 Editor template.
-    """
-    try:
-        with open(ctb_path, 'rb') as f:
-            data = bytearray(f.read())
-        
-        log.info(f"Patching CTB binary: {len(data)} bytes")
-        
-        # Verify magic number (either v4 or v5)
-        magic = struct.unpack('<I', data[0:4])[0]
-        if magic not in (318570759, 318570630):  # v4 or v5
-            log.error(f"Invalid CTB magic number: {magic}")
-            return False
-        
-        version = struct.unpack('<I', data[4:8])[0]
-        log.info(f"CTB version field before conversion: {version}, magic: {magic}")
-        
-        # Force CTB v4 magic number if printer expects it
-        if magic == 318570630:  # v5 magic
-            log.info("Converting CTB v5 magic to v4 for compatibility")
-            struct.pack_into('<I', data, 0, 318570759)  # v4 magic
-            # Also set version to 288 (v4 version field)
-            struct.pack_into('<I', data, 4, 288)
-            log.info("Converted to CTB v4 format (magic: 318570759, version: 288)")
-        
-        # Correct header offsets from 010 Editor template:
-        # Offset 84: PrintParametersOffsetAddress
-        # Offset 104: SlicerOffset
-        
-        print_params_offset = struct.unpack('<I', data[84:88])[0]
-        print_params_size = struct.unpack('<I', data[88:92])[0]
-        log.info(f"PrintParameters at offset: {print_params_offset}, size: {print_params_size}")
-        
-        if print_params_offset <= 0 or print_params_offset >= len(data):
-            log.error(f"Invalid PrintParameters offset: {print_params_offset}")
-            return False
-        
-        # PRINT_PARAMETERS structure:
-        # +0: BottomLiftHeight (float)
-        # +4: BottomLiftSpeed (float)
-        # +8: LiftHeight (float)
-        # +12: LiftSpeed (float)
-        # +16: RetractSpeed (float)
-        
-        bottom_lift_height = float(params.get('bottom_lift_height_mm', 5.0))
-        bottom_lift_speed = float(params.get('bottom_lift_speed_mm_s', 65.0))
-        lift_height = float(params.get('lift_height_mm', 6.0))
-        lift_speed = float(params.get('lift_speed_mm_s', 65.0))
-        retract_speed = float(params.get('retract_speed_mm_s', 150.0))
-        
-        struct.pack_into('<f', data, print_params_offset + 0, bottom_lift_height)
-        struct.pack_into('<f', data, print_params_offset + 4, bottom_lift_speed)
-        struct.pack_into('<f', data, print_params_offset + 8, lift_height)
-        struct.pack_into('<f', data, print_params_offset + 12, lift_speed)
-        struct.pack_into('<f', data, print_params_offset + 16, retract_speed)
-        
-        log.info(f"Patched PrintParameters: BLH={bottom_lift_height}, BLS={bottom_lift_speed}, LH={lift_height}, LS={lift_speed}, RS={retract_speed}")
-        
-        # SlicerInfo offset
-        slicer_offset = struct.unpack('<I', data[104:108])[0]
-        slicer_size = struct.unpack('<I', data[108:112])[0]
-        log.info(f"SlicerInfo at offset: {slicer_offset}, size: {slicer_size}")
-        
-        if slicer_offset <= 0 or slicer_offset >= len(data):
-            log.error(f"Invalid SlicerInfo offset: {slicer_offset}")
-            return False
-        
-        # SLICER_INFO structure (from template):
-        # +28 (7 floats * 4 bytes): MachineNameAddress (uint)
-        # +32: MachineNameSize (uint)
-        
-        machine_name_addr = struct.unpack('<I', data[slicer_offset + 28:slicer_offset + 32])[0]
-        machine_name_size = struct.unpack('<I', data[slicer_offset + 32:slicer_offset + 36])[0]
-        
-        log.info(f"MachineName at offset {machine_name_addr}, current size {machine_name_size}")
-        
-        # Replace machine name
-        machine_name = params.get('machine_name', 'ELEGOO Saturn 4 Ultra')
-        machine_name_bytes = machine_name.encode('utf-8')
-        
-        if machine_name_addr > 0 and machine_name_addr < len(data):
-            # Clear old name area
-            if machine_name_size > 0 and machine_name_addr + machine_name_size <= len(data):
-                for i in range(machine_name_size):
-                    data[machine_name_addr + i] = 0
-            
-            # Write new name
-            new_size = min(len(machine_name_bytes), len(data) - machine_name_addr)
-            data[machine_name_addr:machine_name_addr + new_size] = machine_name_bytes[:new_size]
-            
-            # Update size in SlicerInfo
-            struct.pack_into('<I', data, slicer_offset + 32, new_size)
-            
-            log.info(f"Patched MachineName to: {machine_name} ({new_size} bytes)")
-        else:
-            log.warning(f"MachineName address invalid ({machine_name_addr}), skipping")
-        
-        # Write patched data back
-        with open(ctb_path, 'wb') as f:
-            f.write(data)
-        
-        log.info(f"Successfully patched CTB binary")
-        return True
-        
-    except Exception as e:
-        log.error(f"Binary patching failed: {e}")
-        import traceback
-        log.error(traceback.format_exc())
-        return False
-
 def uvtools_version() -> Tuple[int, str]:
     if not _has_uvtools():
         return (127, "uvtools-cli not found on PATH")
@@ -935,14 +822,15 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
                 return {"ok": False, "error": "uvtools_params_invalid"}
             
             # Convert to target format using UVtools
-            ctb_version = params_obj.get("ctb_version", 4)
+            ctb_version = params_obj.get("ctb_version", 5)  # Default to v5 for newer printers
             
             if target_format == "ctb":
-                cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} Chitubox {shlex.quote(native_path)} --version {ctb_version}"
-                log.info(f"Using Chitubox encoder with explicit version: {ctb_version}")
+                # Use ChituboxEncrypted for Saturn 4 Ultra and similar printers
+                cmd2 = f"uvtools-cli convert {shlex.quote(temp_sl1)} ChituboxEncrypted {shlex.quote(native_path)} --version {ctb_version}"
+                log.info(f"Using ChituboxEncrypted encoder with version: {ctb_version}")
             else:
                 encoder_map = {
-                    "ctb": "Chitubox",
+                    "ctb": "ChituboxEncrypted",
                     "cbddlp": "Chitubox",
                     "photon": "Chitubox",
                     "phz": "PHZ",
@@ -961,7 +849,8 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             rc2, log2 = sh(cmd2, timeout=1800)
             uvtools_elapsed = time.time() - uvtools_start
             log.info(f"UVtools conversion completed in {uvtools_elapsed:.1f}s with rc={rc2}")
-            # Log the FULL UVtools output to see what went wrong
+
+            # Log full UVtools output for debugging
             log.info(f"=== FULL UVTOOLS OUTPUT (first 5000 chars) ===")
             log.info(log2[:5000] if log2 else "NO OUTPUT")
             log.info(f"=== FULL UVTOOLS OUTPUT (last 5000 chars) ===")
@@ -979,13 +868,9 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
 
             log.info(f"UVtools conversion succeeded: {native_path} ({Path(native_path).stat().st_size} bytes)")
             
-            # Apply binary patching for CTB files to fix any parameters UVtools set incorrectly
-            if target_format == "ctb":
-                log.info("Applying binary patches to set correct printer parameters")
-                if not patch_ctb_binary(native_path, params_obj):
-                    log.warning("Binary patching failed, but continuing with UVtools output")
-                else:
-                    log.info(f"Binary patching complete")
+            # ChituboxEncrypted encoder should produce valid CTB files without needing binary patching
+            # Binary patching is disabled to avoid corrupting the file
+            log.info("Skipping binary patching - ChituboxEncrypted encoder produces valid files")
             
             # Clean up temp SL1 (only if we created it, not if it's PrusaSlicer's original)
             if temp_sl1 != native_found:
@@ -1021,7 +906,7 @@ def start_job(payload: Dict[str, Any], authorization: str = Header(None)):
             
             report = {
                 "native_ext": native_ext, 
-                "native_source": "uvtools",
+                "native_source": "uvtools_encrypted",
                 "layers": len(glob.glob(os.path.join(slices_dir, "*.png")))
             }
             
